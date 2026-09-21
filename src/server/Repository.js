@@ -142,6 +142,12 @@ var Repository = (function () {
 
   /* ------------------------------------------------------------------ reads */
 
+  /** Data rows in a table, without reading them. Used to pick a read strategy. */
+  function rowCount(tableName) {
+    var meta = getHeaders(tableName);
+    return Math.max(0, meta.sheet.getLastRow() - 1);
+  }
+
   /** Every row of a table. Use only for small tables or when no index applies. */
   function readAll(tableName) {
     assertSameDatabase();
@@ -582,6 +588,7 @@ var Repository = (function () {
     MANAGED_COLUMNS: MANAGED_COLUMNS,
     resetCache: resetCache,
     getHeaders: getHeaders,
+    rowCount: rowCount,
     readAll: readAll,
     query: query,
     queryByCase: queryByCase,

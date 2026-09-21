@@ -36,8 +36,10 @@ var Rules = (function () {
    * Splits the vendors on a Case into those whose quotation counts and those
    * whose does not, with the reason. SPEC §6.1 lists six conditions; all must hold.
    */
-  function assessQuotes(caseRecord, data, vendorMaster) {
-    var requireAllItemsPriced = Config.getBool('REQUIRE_ALL_ITEMS_PRICED', true);
+  function assessQuotes(caseRecord, data, vendorMaster, opts) {
+    var options = opts || {};
+    var requireAllItemsPriced = !options.skipPricingCheck &&
+      Config.getBool('REQUIRE_ALL_ITEMS_PRICED', true);
     var today = Utils.today();
     var master = vendorMaster || vendorsById(data.caseVendors);
 
@@ -149,21 +151,48 @@ var Rules = (function () {
     };
   }
 
-  /** Cheap per-Case counts for the My Cases badge. */
+  /**
+   * Beyond this many quote lines, a list screen stops reading the whole
+   * Quote_Lines sheet. A single getValues over hundreds of thousands of cells
+   * is the one thing here that could push a request past the Apps Script
+   * execution limit, and a list badge is not worth that risk.
+   */
+  var LIST_SUMMARY_MAX_QUOTE_ROWS = 60000;
+
+  /**
+   * Per-Case quote counts for the My Cases and Team View badges.
+   *
+   * Reads each table once and groups in memory, which beats per-Case lookups:
+   * TextFinder costs one API call per Case per table, so a page of 50 Cases
+   * would cost 150 calls against three reads.
+   *
+   * Above LIST_SUMMARY_MAX_QUOTE_ROWS the completeness condition is dropped and
+   * the result is flagged `approximate`. Case Detail and every status change
+   * still evaluate the full rule against one Case, so nothing is ever decided
+   * on an approximate number.
+   */
   function summarizeCases(cases) {
     if (!cases.length) return {};
     var required = minQuotesRequired();
     var byCase = {};
     cases.forEach(function (c) { byCase[c.Case_ID] = { items: [], caseVendors: [], quoteLines: [] }; });
 
-    collectInto(byCase, 'Case_Items', 'items');
     collectInto(byCase, 'Case_Vendors', 'caseVendors');
-    collectInto(byCase, 'Quote_Lines', 'quoteLines');
+
+    var precise = Repository.rowCount('Quote_Lines') <= LIST_SUMMARY_MAX_QUOTE_ROWS;
+    if (precise) {
+      collectInto(byCase, 'Case_Items', 'items');
+      collectInto(byCase, 'Quote_Lines', 'quoteLines');
+    }
 
     var out = {};
     cases.forEach(function (c) {
-      var assessment = assessQuotes(c, byCase[c.Case_ID]);
-      out[c.Case_ID] = { valid: assessment.valid.length, required: required };
+      var assessment = assessQuotes(c, byCase[c.Case_ID], null, { skipPricingCheck: !precise });
+      out[c.Case_ID] = {
+        valid: assessment.valid.length,
+        required: required,
+        approximate: !precise
+      };
     });
     return out;
   }
@@ -216,6 +245,7 @@ var Rules = (function () {
 
   return {
     REJECTION_REASONS: REJECTION_REASONS,
+    LIST_SUMMARY_MAX_QUOTE_ROWS: LIST_SUMMARY_MAX_QUOTE_ROWS,
     loadData: loadData,
     assessQuotes: assessQuotes,
     minQuotesRequired: minQuotesRequired,

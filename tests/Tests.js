@@ -2085,3 +2085,67 @@ test('Team View reports workload per buyer and is closed to buyers', function ()
     assertEquals(auditorView.canReassign, false, 'auditors watch, they do not move work');
   });
 });
+
+/* ============================================================================
+ * Coverage guard — every acceptance test in SPEC §13 must have a home here
+ * ==========================================================================*/
+
+test('T0 all eighteen acceptance tests from SPEC section 13 are covered', function () {
+  var covered = {};
+  TEST_REGISTRY.forEach(function (t) {
+    var match = /^T(\d+)/.exec(t.name);
+    if (match) covered[Number(match[1])] = true;
+  });
+  var missing = [];
+  for (var n = 1; n <= 18; n++) {
+    if (!covered[n]) missing.push('T' + n);
+  }
+  assertEquals(missing.join(', '), '', 'acceptance tests without a covering test');
+});
+
+test('the list badge falls back to an approximate count on a very large database', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    quoteVendors(USERS.buyerA, c.caseId, c.items, 2);
+
+    // A third vendor quotes only one of the two items.
+    var partial = createVendorAs(USERS.buyerA, {
+      Vendor_Name: 'ผู้ขายเสนอไม่ครบ', Tax_ID: '0105577770001',
+      Contact_Phone: '027770001', Contact_Email: 'partial@example.com', Address: 'ที่อยู่ พาร์เชียล'
+    }).vendor;
+    var cv = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_addVendorToCase(c.caseId, partial.Vendor_ID, {
+        Response_Status: 'QUOTED', Quote_No: 'QT-P', Quote_Date: '2026-01-25'
+      })).caseVendor;
+    });
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit: 'SET', Vendor_Unit_Price: 750 }
+      ]));
+    });
+
+    var exact = asUser(USERS.buyerA, function () { return assertApiOk(api_listCases({ scope: 'mine' })); });
+    assertEquals(exact.cases[0].quotes.valid, 2, 'exact count excludes the partial quotation');
+    assertEquals(exact.cases[0].quotes.approximate, false, 'and says it is exact');
+
+    // Force the fallback by pretending Quote_Lines is enormous.
+    var realRowCount = Repository.rowCount;
+    Repository.rowCount = function (tableName) {
+      return tableName === 'Quote_Lines' ? Rules.LIST_SUMMARY_MAX_QUOTE_ROWS + 1 : realRowCount(tableName);
+    };
+    try {
+      var approx = asUser(USERS.buyerA, function () { return assertApiOk(api_listCases({ scope: 'mine' })); });
+      assertEquals(approx.cases[0].quotes.approximate, true, 'flagged as approximate');
+      assertEquals(approx.cases[0].quotes.valid, 3, 'the completeness condition was dropped');
+
+      // The Case page and the transition check stay exact regardless.
+      var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+      assertEquals(bundle.rules.quotes.valid, 2, 'Case Detail is never approximate');
+      assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING'));
+      assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'RULE_VIOLATION',
+        'and nothing is decided on the approximate number');
+    } finally {
+      Repository.rowCount = realRowCount;
+    }
+  });
+});

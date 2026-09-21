@@ -124,7 +124,13 @@
   function quoteBadge(quotes) {
     if (!quotes) return '<span class="faint">—</span>';
     var kind = quotes.valid >= quotes.required ? 'ok' : (quotes.valid === 0 ? 'bad' : 'warn');
-    return '<span class="badge ' + kind + '">' + quotes.valid + ' / ' + quotes.required + '</span>';
+    // On a very large database the list badge drops the "priced every item"
+    // condition; the Case page always shows the exact figure.
+    var hint = quotes.approximate
+      ? ' title="ตัวเลขโดยประมาณ ดูจำนวนที่แน่นอนได้ในหน้ารายละเอียดงาน"'
+      : '';
+    return '<span class="badge ' + kind + '"' + hint + '>' +
+      (quotes.approximate ? '≈ ' : '') + quotes.valid + ' / ' + quotes.required + '</span>';
   }
 
   function nextActionCell(next) {
