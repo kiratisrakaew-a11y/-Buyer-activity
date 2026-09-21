@@ -208,12 +208,15 @@
       host.innerHTML =
         '<div class="btn-row" style="margin-bottom:14px">' +
           (ctx.canEdit ? '<button type="button" class="primary" id="addItemBtn">+ เพิ่มรายการ</button>' : '') +
+          (ctx.canEdit ? '<button type="button" id="pasteItemsBtn">วางจาก Excel</button>' : '') +
           '<span class="faint">ยอดรวมคำนวณจาก จำนวน × ราคาต่อหน่วย ตอนแสดงผลเท่านั้น ไม่ได้เก็บไว้ในฐานข้อมูล</span>' +
         '</div>' +
         (ctx.items.length ? table(ctx) : '<div class="empty">ยังไม่มีรายการในงานนี้</div>');
 
       var add = host.querySelector('#addItemBtn');
       if (add) add.onclick = function () { openItem(ctx, null); };
+      var paste = host.querySelector('#pasteItemsBtn');
+      if (paste) paste.onclick = function () { openPaste(ctx); };
       host.querySelectorAll('[data-edit]').forEach(function (b) {
         b.onclick = function () { openItem(ctx, findItem(ctx, b.dataset.edit)); };
       });
@@ -298,6 +301,165 @@
           }).catch(App.showError);
       }
     });
+  }
+
+  /* ------------------------------------------------------ วางจาก Excel */
+
+  /**
+   * The column order a pasted block is read in. Only the first three are required,
+   * so a buyer can copy just "รายละเอียด / จำนวน / หน่วย" out of a BOQ and stop there.
+   */
+  var PASTE_COLUMNS = [
+    { key: 'Item_Description', label: 'รายละเอียดรายการ', required: true },
+    { key: 'Quantity', label: 'จำนวน', required: true },
+    { key: 'Unit', label: 'หน่วย', required: true, list: 'UNIT' },
+    { key: 'Media_Site', label: 'ป้าย / จุดติดตั้ง' },
+    { key: 'Media_Type', label: 'ประเภทสื่อ', list: 'MEDIA_TYPE' },
+    { key: 'Asset_No', label: 'Asset No.' },
+    { key: 'Remark', label: 'หมายเหตุ' },
+    { key: 'Item_Code', label: 'รหัสสินค้า' }
+  ];
+
+  /**
+   * Splits a pasted block into rows.
+   *
+   * Excel puts a tab between cells, so a tab anywhere in the block settles the
+   * separator for the whole paste — deciding per line would split a description
+   * that happens to contain a comma. Only when there is no tab at all does it fall
+   * back to commas, which is what someone typing the list by hand would use.
+   */
+  function parsePaste(text) {
+    var raw = String(text || '').replace(/\r\n?/g, '\n');
+    var separator = raw.indexOf('\t') >= 0 ? '\t' : ',';
+    var lines = raw.split('\n').filter(function (line) { return line.trim() !== ''; });
+
+    return lines.map(function (line, index) {
+      var cells = line.split(separator).map(function (c) { return c.trim(); });
+      var row = { no: index + 1, cells: cells, values: {}, error: '', skipped: false };
+
+      PASTE_COLUMNS.forEach(function (column, i) {
+        row.values[column.key] = cells[i] === undefined ? '' : cells[i];
+      });
+
+      row.values.Unit = App.codeFromLabel('UNIT', row.values.Unit);
+      row.values.Media_Type = App.codeFromLabel('MEDIA_TYPE', row.values.Media_Type);
+      row.values.Quantity = String(row.values.Quantity).replace(/[,\s\u00a0]/g, '');
+
+      // A buyer who drags across the table in Excel takes the header row with them.
+      // The giveaway is the unit cell: a data row names a real unit, a header row
+      // names the column. Testing the quantity alone is not enough — it would read
+      // a row with a mistyped quantity as a header and drop it without saying so.
+      if (index === 0 && lines.length > 1 && cells.length > 2 &&
+          !isNumeric(cells[1]) && !App.hasCode('UNIT', row.values.Unit)) {
+        row.skipped = true;
+        row.error = 'ข้าม — ดูเหมือนหัวตาราง';
+        return row;
+      }
+
+      row.error = rowProblem(row.values, cells);
+      return row;
+    });
+  }
+
+  function rowProblem(values, cells) {
+    if (cells.length < 3) return 'ต้องมีอย่างน้อย 3 คอลัมน์ (รายละเอียด / จำนวน / หน่วย)';
+    if (!values.Item_Description) return 'ไม่มีรายละเอียดรายการ';
+    if (!isNumeric(values.Quantity)) return 'จำนวน "' + values.Quantity + '" ไม่ใช่ตัวเลข';
+    if (Number(values.Quantity) <= 0) return 'จำนวนต้องมากกว่า 0';
+    if (!values.Unit) return 'ไม่มีหน่วย';
+    if (!App.hasCode('UNIT', values.Unit)) return 'ไม่รู้จักหน่วย "' + values.Unit + '"';
+    if (values.Media_Type && !App.hasCode('MEDIA_TYPE', values.Media_Type)) {
+      return 'ไม่รู้จักประเภทสื่อ "' + values.Media_Type + '"';
+    }
+    return '';
+  }
+
+  function isNumeric(value) {
+    var cleaned = String(value === undefined ? '' : value).replace(/[,\s\u00a0]/g, '');
+    return cleaned !== '' && !isNaN(Number(cleaned));
+  }
+
+  function pastePreview(rows) {
+    if (!rows.length) {
+      return '<div class="empty">วางข้อมูลในช่องด้านบน แล้วตารางตรวจทานจะขึ้นที่นี่</div>';
+    }
+    var body = rows.map(function (row) {
+      var cls = row.skipped ? 'faint' : (row.error ? 'bad-row' : '');
+      return '<tr class="' + cls + '">' +
+        '<td class="num">' + App.esc(row.no) + '</td>' +
+        '<td>' + App.esc(row.values.Item_Description) + '</td>' +
+        '<td class="num">' + App.esc(row.values.Quantity) + '</td>' +
+        '<td>' + App.esc(App.labelOf('UNIT', row.values.Unit) || row.values.Unit) + '</td>' +
+        '<td>' + App.esc(row.values.Media_Site) + '</td>' +
+        '<td>' + App.esc(App.labelOf('MEDIA_TYPE', row.values.Media_Type) || row.values.Media_Type) + '</td>' +
+        '<td>' + App.esc(row.values.Asset_No) + '</td>' +
+        '<td>' + (row.error
+          ? '<span class="badge ' + (row.skipped ? 'info' : 'bad') + '">' + App.esc(row.error) + '</span>'
+          : '<span class="badge ok">พร้อม</span>') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    var ready = rows.filter(function (r) { return !r.error; }).length;
+    var bad = rows.filter(function (r) { return r.error && !r.skipped; }).length;
+
+    return '<div class="btn-row" style="margin-bottom:8px">' +
+      '<span class="badge ' + (ready ? 'ok' : 'warn') + '">พร้อมบันทึก ' + ready + ' รายการ</span>' +
+      (bad ? '<span class="badge bad">มีปัญหา ' + bad + ' แถว</span>' : '') +
+      '</div>' +
+      '<div class="table-wrap" style="max-height:300px;overflow:auto"><table><thead><tr>' +
+      '<th class="num">#</th><th>รายละเอียด</th><th class="num">จำนวน</th><th>หน่วย</th>' +
+      '<th>ป้าย/จุดติดตั้ง</th><th>ประเภทสื่อ</th><th>Asset No.</th><th>สถานะ</th>' +
+      '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }
+
+  function openPaste(ctx) {
+    var legend = PASTE_COLUMNS.map(function (c, i) {
+      return (i + 1) + '. ' + c.label + (c.required ? ' *' : '');
+    }).join('  ·  ');
+
+    var dialog = App.modal({
+      title: 'วางรายการจาก Excel',
+      submitLabel: 'บันทึกทั้งหมด',
+      wide: true,
+      body:
+        '<div class="alert info">คัดลอกจาก Excel แล้ววางในช่องข้างล่าง เรียงคอลัมน์ตามนี้ ' +
+          '(มี * คือบังคับ คอลัมน์ท้ายๆ ที่ไม่มีจะเว้นไว้ก็ได้)<br>' +
+          '<strong>' + App.esc(legend) + '</strong><br>' +
+          'หน่วยและประเภทสื่อ พิมพ์เป็นภาษาไทยอย่างที่เห็นใน dropdown ได้เลย เช่น "ตารางเมตร"</div>' +
+        '<div class="field"><label for="pasteBox">วางที่นี่</label>' +
+          '<textarea id="pasteBox" name="pasteBox" rows="8" spellcheck="false" ' +
+          'style="font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre"></textarea></div>' +
+        '<div id="pastePreview"></div>',
+      onSubmit: function (form, close) {
+        var rows = parsePaste(form.pasteBox.value);
+        var usable = rows.filter(function (r) { return !r.error; });
+        var broken = rows.filter(function (r) { return r.error && !r.skipped; });
+
+        if (broken.length) {
+          App.toast('แก้แถวที่มีปัญหาให้ครบก่อน จึงจะบันทึกได้ (' + broken.length + ' แถว)', 'bad');
+          return;
+        }
+        if (!usable.length) {
+          App.toast('ยังไม่มีรายการให้บันทึก', 'bad');
+          return;
+        }
+        // No row cap here on purpose: ItemService owns that limit, and a second
+        // copy of the number would drift away from it.
+        App.api('api_saveItems', ctx.caseId, usable.map(function (r) { return r.values; }))
+          .then(function (result) {
+            close();
+            App.toast('เพิ่มรายการแล้ว ' + result.inserted + ' รายการ', 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+      }
+    });
+
+    var box = dialog.form.querySelector('#pasteBox');
+    var preview = dialog.form.querySelector('#pastePreview');
+    function refresh() { preview.innerHTML = pastePreview(parsePaste(box.value)); }
+    box.addEventListener('input', refresh);
+    refresh();
   }
 
   function removeItem(ctx, item) {

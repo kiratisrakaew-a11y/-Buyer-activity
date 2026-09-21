@@ -49,6 +49,9 @@
     host.querySelectorAll('input[data-price]').forEach(function (input) {
       input.addEventListener('input', function () { recalc(host, ctx); });
     });
+    host.querySelectorAll('[data-pastecol]').forEach(function (b) {
+      b.onclick = function () { openPricePaste(host, ctx, b.dataset.pastecol); };
+    });
   }
 
   function find(ctx, caseVendorId) {
@@ -117,7 +120,12 @@
     var head = '<tr><th>รายการ</th><th class="num">จำนวน</th><th>หน่วย</th>' +
       ctx.vendors.map(function (v) {
         return '<th class="num">' + App.esc((v.vendor && v.vendor.Vendor_Name) || v.caseVendor.Vendor_ID) +
-          '<div class="faint">ราคาต่อหน่วย</div></th>';
+          '<div class="faint">ราคาต่อหน่วย</div>' +
+          (ctx.canEdit
+            ? '<button type="button" class="subtle small" data-pastecol="' +
+              App.esc(v.caseVendor.Case_Vendor_ID) + '">วางราคาจาก Excel</button>'
+            : '') +
+          '</th>';
       }).join('') + '</tr>';
 
     var body = ctx.items.map(function (item) {
@@ -226,6 +234,113 @@
         ctx.refresh();
       }).catch(App.showError);
     });
+  }
+
+  /* -------------------------------------------------- วางราคาจาก Excel */
+
+  /**
+   * Fills one vendor's column from a block copied out of their quotation.
+   *
+   * It only types into the grid — nothing is sent until the buyer presses
+   * "บันทึกราคา", which keeps the reason prompt for overwriting existing prices
+   * exactly where it already is. A paste is undone by closing the tab without saving.
+   */
+  function openPricePaste(host, ctx, caseVendorId) {
+    var entry = find(ctx, caseVendorId);
+    var vendorName = (entry && entry.vendor && entry.vendor.Vendor_Name) || caseVendorId;
+    var inputs = Array.prototype.slice.call(
+      host.querySelectorAll('input[data-price][data-cv="' + cssEscape(caseVendorId) + '"]'));
+
+    var dialog = App.modal({
+      title: 'วางราคาของ ' + vendorName,
+      submitLabel: 'เติมลงช่องราคา',
+      wide: true,
+      body:
+        '<div class="alert info">คัดลอกคอลัมน์ <strong>ราคาต่อหน่วย</strong> จากใบเสนอราคา ' +
+          'แล้ววางที่นี่ — ระบบจะกรอกลงเรียงจากบนลงตามลำดับรายการในตาราง<br>' +
+          'บรรทัดที่เว้นว่าง = ผู้ขายไม่ได้เสนอรายการนั้น · ตัวคั่นหลักพันและสัญลักษณ์เงินตัดออกให้เอง<br>' +
+          'ยังไม่บันทึกจนกว่าจะกด "บันทึกราคา" ในหน้าหลัก</div>' +
+        '<div class="field"><label for="priceBox">ราคาต่อหน่วย (บรรทัดละ 1 รายการ)</label>' +
+          '<textarea id="priceBox" name="priceBox" rows="8" spellcheck="false" ' +
+          'style="font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre"></textarea></div>' +
+        '<div id="pricePreview"></div>',
+      onSubmit: function (form, close) {
+        var prices = parsePriceColumn(form.priceBox.value);
+        if (!prices.length) {
+          App.toast('ยังไม่ได้วางราคา', 'bad');
+          return;
+        }
+        if (prices.some(function (p) { return p.invalid; })) {
+          App.toast('มีบรรทัดที่ไม่ใช่ตัวเลข แก้ก่อนจึงจะเติมลงได้', 'bad');
+          return;
+        }
+        prices.slice(0, inputs.length).forEach(function (p, i) {
+          inputs[i].value = p.blank ? '' : p.value;
+        });
+        recalc(host, ctx);
+        close();
+        App.toast('เติมราคาแล้ว ' + Math.min(prices.length, inputs.length) +
+          ' รายการ — กด "บันทึกราคา" เพื่อบันทึก', 'ok');
+      }
+    });
+
+    var box = dialog.form.querySelector('#priceBox');
+    var preview = dialog.form.querySelector('#pricePreview');
+    function refresh() {
+      preview.innerHTML = pricePreview(parsePriceColumn(box.value), ctx.items, inputs.length);
+    }
+    box.addEventListener('input', refresh);
+    refresh();
+  }
+
+  /**
+   * Reads a pasted column of prices. A multi-column paste keeps the last cell of
+   * each line, because a buyer dragging across a quotation usually catches the
+   * description alongside the amount and the amount is what sits on the right.
+   */
+  function parsePriceColumn(text) {
+    var lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+
+    return lines.map(function (line) {
+      var cells = line.split('\t');
+      var cell = cells[cells.length - 1];
+      var cleaned = String(cell).replace(/[,\s\u00a0\u0e3f]/g, '').replace(/^THB/i, '');
+      if (cleaned === '') return { blank: true, value: '' };
+      if (isNaN(Number(cleaned))) return { invalid: true, value: String(cell).trim() };
+      if (Number(cleaned) < 0) return { invalid: true, value: String(cell).trim() };
+      return { value: cleaned };
+    });
+  }
+
+  function pricePreview(prices, items, slots) {
+    if (!prices.length) {
+      return '<div class="empty">วางราคาในช่องด้านบน แล้วตารางจะแสดงว่าราคาไหนจะลงรายการใด</div>';
+    }
+    var rows = prices.map(function (p, i) {
+      var item = items[i];
+      var beyond = i >= slots;
+      return '<tr class="' + (p.invalid || beyond ? 'bad-row' : '') + '">' +
+        '<td class="num">' + (i + 1) + '</td>' +
+        '<td>' + (item ? App.esc(item.Item_Description) : '<span class="faint">—</span>') + '</td>' +
+        '<td class="num">' + (item ? App.esc(item.Quantity) : '') + '</td>' +
+        '<td class="num">' + App.esc(p.blank ? '' : p.value) + '</td>' +
+        '<td>' + (beyond ? '<span class="badge bad">เกิจำนวนรายการ จะถูกตัดทิ้ง</span>'
+          : p.invalid ? '<span class="badge bad">ไม่ใช่ตัวเลข</span>'
+          : p.blank ? '<span class="badge warn">เว้นว่าง — ไม่เสนอรายการนี้</span>'
+          : '<span class="badge ok">พร้อม</span>') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    var mismatch = prices.length === slots ? '' :
+      '<div class="alert warn">วางมา ' + prices.length + ' บรรทัด แต่งานนี้มี ' + slots +
+      ' รายการ กรุณาตรวจว่าราคาตรงกับรายการก่อนเติมลง</div>';
+
+    return mismatch +
+      '<div class="table-wrap" style="max-height:300px;overflow:auto"><table><thead><tr>' +
+      '<th class="num">#</th><th>จะลงรายการ</th><th class="num">จำนวน</th>' +
+      '<th class="num">ราคาต่อหน่วย</th><th>สถานะ</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div>';
   }
 
   /* ------------------------------------------------------------ vendor forms */

@@ -849,6 +849,157 @@ test('item quantity must be greater than zero', function () {
   });
 });
 
+test('api_saveItems inserts a whole pasted block and numbers the lines in order', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_saveItems(caseId, [
+        { Item_Description: '\u0e42\u0e04\u0e23\u0e07\u0e40\u0e2b\u0e25\u0e47\u0e01', Quantity: 2, Unit: 'SET' },
+        { Item_Description: '\u0e41\u0e1c\u0e48\u0e19\u0e44\u0e27\u0e19\u0e34\u0e25', Quantity: 48, Unit: 'SQM' },
+        { Item_Description: '\u0e04\u0e48\u0e32\u0e15\u0e34\u0e14\u0e15\u0e31\u0e49\u0e07', Quantity: 1, Unit: 'JOB' }
+      ]));
+    });
+
+    assertEquals(result.inserted, 3, 'all three landed in one call');
+    var stored = ItemService.listForCase(caseId);
+    assertEquals(stored.length, 3, 'three items on the Case');
+    assertEquals(stored.map(function (i) { return i.Line_No; }).join(','), '1,2,3', 'contiguous line numbers');
+    assertEquals(stored[1].Item_Description, '\u0e41\u0e1c\u0e48\u0e19\u0e44\u0e27\u0e19\u0e34\u0e25', 'paste order is kept');
+  });
+});
+
+test('a pasted block continues the line numbering of items already on the Case', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    addItem(USERS.buyerA, caseId);
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveItems(caseId, [
+        { Item_Description: '\u0e07\u0e32\u0e19\u0e17\u0e32\u0e2a\u0e35', Quantity: 1, Unit: 'JOB' },
+        { Item_Description: '\u0e07\u0e32\u0e19\u0e44\u0e1f', Quantity: 1, Unit: 'JOB' }
+      ]));
+    });
+
+    assertEquals(ItemService.listForCase(caseId).map(function (i) { return i.Line_No; }).join(','),
+      '1,2,3', 'the paste picks up where the existing item left off');
+  });
+});
+
+test('a pasted block accepts the Thai labels a BOQ column actually holds', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveItems(caseId, [
+        { Item_Description: '\u0e1b\u0e49\u0e32\u0e22', Quantity: '1,250.50', Unit: '\u0e15\u0e32\u0e23\u0e32\u0e07\u0e40\u0e21\u0e15\u0e23', Media_Type: '\u0e08\u0e2d LED' }
+      ]));
+    });
+
+    var item = ItemService.listForCase(caseId)[0];
+    assertEquals(item.Unit, 'SQM', 'the Thai unit label resolved to its code');
+    assertEquals(item.Media_Type, 'LED', 'the Thai media label resolved to its code');
+    assertEquals(Number(item.Quantity), 1250.5, 'the thousands separator a spreadsheet copies is stripped');
+  });
+});
+
+test('one bad row rejects the whole paste, so no half of it is left behind', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var error = asUser(USERS.buyerA, function () {
+      return assertApiError(api_saveItems(caseId, [
+        { Item_Description: '\u0e14\u0e35', Quantity: 1, Unit: 'PCS' },
+        { Item_Description: '\u0e2b\u0e19\u0e48\u0e27\u0e22\u0e1c\u0e34\u0e14', Quantity: 1, Unit: 'BOX' },
+        { Item_Description: '\u0e14\u0e35\u0e2d\u0e35\u0e01\u0e2d\u0e31\u0e19', Quantity: 1, Unit: 'PCS' }
+      ]), 'VALIDATION', 'the unknown unit stops the paste');
+    });
+
+    assertContains(error.message, '\u0e41\u0e16\u0e27\u0e17\u0e35\u0e48 2', 'the message names the offending row');
+    assertEquals(ItemService.listForCase(caseId).length, 0,
+      'nothing at all was written, not even the two good rows');
+  });
+});
+
+test('a pasted block runs the quote rules once and warns about a reused Media_Site', function () {
+  withUsers(function () {
+    var first = createCaseAs(USERS.buyerA);
+    addItem(USERS.buyerA, first, { Media_Site: 'RAMA9-001' });
+
+    var second = createCaseAs(USERS.buyerA, { Request_Ref: 'MEMO-2026-002' });
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_saveItems(second, [
+        { Item_Description: '\u0e0b\u0e48\u0e2d\u0e21\u0e1b\u0e49\u0e32\u0e22', Quantity: 1, Unit: 'JOB', Media_Site: 'RAMA9-001' },
+        { Item_Description: '\u0e17\u0e32\u0e2a\u0e35\u0e43\u0e2b\u0e21\u0e48', Quantity: 1, Unit: 'JOB', Media_Site: 'RAMA9-001' }
+      ]));
+    });
+
+    var duplicates = result.warnings.filter(function (w) { return w.indexOf('RAMA9-001') >= 0; });
+    assertEquals(duplicates.length, 1,
+      'the same site twice in one paste is reported once, not once per row');
+    assertContains(duplicates[0], first, 'names the other Case');
+  });
+});
+
+test('a paste larger than the cap is refused before anything is written', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var rows = [];
+    for (var i = 0; i <= ItemService.MAX_BULK_ROWS; i++) {
+      rows.push({ Item_Description: '\u0e23\u0e32\u0e22\u0e01\u0e32\u0e23 ' + i, Quantity: 1, Unit: 'PCS' });
+    }
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_saveItems(caseId, rows), 'VALIDATION', 'over the cap');
+    });
+    assertEquals(ItemService.listForCase(caseId).length, 0, 'nothing written');
+  });
+});
+
+test('api_saveItems is closed to the roles that may not edit a Case', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.auditor, function () {
+      assertApiError(api_saveItems(caseId, [
+        { Item_Description: '\u0e02\u0e2d\u0e07', Quantity: 1, Unit: 'PCS' }
+      ]), 'FORBIDDEN', 'an auditor cannot paste items');
+    });
+    assertEquals(ItemService.listForCase(caseId).length, 0, 'nothing written');
+  });
+});
+
+test('a pasted block writes one CREATE row per item into the Change_Log', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveItems(caseId, [
+        { Item_Description: 'ก', Quantity: 1, Unit: 'PCS' },
+        { Item_Description: 'ข', Quantity: 2, Unit: 'PCS' },
+        { Item_Description: 'ค', Quantity: 3, Unit: 'PCS' }
+      ]));
+    });
+    var creates = Repository.query('Change_Log', {
+      where: function (r) { return r.Table_Name === 'Case_Items' && r.Action === 'CREATE'; }
+    });
+    assertEquals(creates.length, 3, 'one audit row per pasted item');
+    assertEquals(creates[0].Case_ID, caseId, 'each is filed under the Case');
+    assertEquals(creates[0].User, USERS.buyerA, 'and against whoever pasted');
+  });
+});
+
+test('a rejected paste leaves no Change_Log trace either', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_saveItems(caseId, [
+        { Item_Description: 'ดี', Quantity: 1, Unit: 'PCS' },
+        { Item_Description: '', Quantity: 1, Unit: 'PCS' }
+      ]), 'VALIDATION', 'blank description');
+    });
+    var creates = Repository.query('Change_Log', {
+      where: function (r) { return r.Table_Name === 'Case_Items'; }
+    });
+    assertEquals(creates.length, 0, 'no audit rows from a rejected paste');
+    assertEquals(ItemService.nextLineNo(caseId), 1, 'and the line numbering did not advance');
+  });
+});
+
 test('editing an item stores a new version and honours optimistic locking', function () {
   withUsers(function () {
     var caseId = createCaseAs(USERS.buyerA);

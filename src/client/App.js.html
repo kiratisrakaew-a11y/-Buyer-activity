@@ -108,14 +108,42 @@ var App = (function () {
     return n.toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
+  /** The active entries of one Config_Lists list, as the server sent them. */
+  function listOf(listName) {
+    return state.lists[listName] || [];
+  }
+
+  function hasCode(listName, code) {
+    return listOf(listName).some(function (it) { return it.code === code; });
+  }
+
   /** Thai label for a code, falling back to the code itself. */
   function labelOf(listName, code) {
     if (!code) return '';
-    var items = state.lists[listName] || [];
+    var items = listOf(listName);
     for (var i = 0; i < items.length; i++) {
       if (items[i].code === code) return items[i].label;
     }
     return code;
+  }
+
+  /**
+   * The inverse of labelOf: a column pasted out of a BOQ holds "ตารางเมตร", not "SQM".
+   * Matches the code first, then the Thai label, and hands back anything it does
+   * not recognise so the preview can mark that row instead of silently blanking it.
+   */
+  function codeFromLabel(listName, text) {
+    if (!text) return '';
+    var wanted = String(text).trim();
+    var folded = wanted.toUpperCase();
+    var items = listOf(listName);
+    for (var i = 0; i < items.length; i++) {
+      if (String(items[i].code).toUpperCase() === folded) return items[i].code;
+    }
+    for (var j = 0; j < items.length; j++) {
+      if (String(items[j].label).trim() === wanted) return items[j].code;
+    }
+    return wanted;
   }
 
   function statusLabel(code) {
@@ -135,7 +163,7 @@ var App = (function () {
 
   /** <option> markup for a config list, optionally filtered by parent code. */
   function optionsFor(listName, selected, parentCode, placeholder) {
-    var items = (state.lists[listName] || []).filter(function (it) {
+    var items = listOf(listName).filter(function (it) {
       if (parentCode === undefined || parentCode === null || parentCode === '') return true;
       return !it.parent || it.parent === parentCode;
     });
@@ -351,7 +379,10 @@ var App = (function () {
     fmtDateTime: fmtDateTime,
     toInputDate: toInputDate,
     fmtMoney: fmtMoney,
+    listOf: listOf,
+    hasCode: hasCode,
     labelOf: labelOf,
+    codeFromLabel: codeFromLabel,
     statusLabel: statusLabel,
     statusBadgeClass: statusBadgeClass,
     optionsFor: optionsFor,

@@ -114,6 +114,16 @@ function api_saveItem(caseId, item, version, reason) {
   });
 }
 
+/**
+ * Bulk insert for the "วางจาก Excel" button. Separate from api_saveItem because it
+ * is insert-only and atomic: there is no version to check and no half-success.
+ */
+function api_saveItems(caseId, items) {
+  return handle('api_saveItems', API_ROLES.BUYER_HEAD, function (user) {
+    return ItemService.saveMany(user, caseId, items || []);
+  });
+}
+
 /* ---------------------------------------------------------------- delete */
 
 /**
