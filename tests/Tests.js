@@ -1445,3 +1445,421 @@ test('deleting an activity is a soft delete with a reason', function () {
       'but still in the sheet for audit');
   });
 });
+
+/* ============================================================================
+ * Phase 7 — StatusEngine, the three-quote rule, exceptions, reopen, PR numbers
+ * ==========================================================================*/
+
+function currentCase(caseId) {
+  return Repository.requireById('Cases', caseId);
+}
+
+/** Moves a Case, always sending the version the sheet currently holds. */
+function moveTo(email, caseId, toStatus, reason) {
+  return asUser(email, function () {
+    return api_changeStatus(caseId, toStatus, currentCase(caseId).Version, reason);
+  });
+}
+
+/** Keeps every fixture vendor distinct, so no test trips the Tax_ID rule by accident. */
+var vendorSeq = 0;
+
+/** n vendors, each invited, QUOTED and priced on every item of the Case. */
+function quoteVendors(email, caseId, items, count, pricesPerVendor) {
+  var created = [];
+  for (var i = 0; i < count; i++) {
+    var n = ++vendorSeq;
+    var vendor = createVendorAs(email, {
+      Vendor_Name: 'ผู้ขายที่ ' + n,
+      Tax_ID: '010550000' + (1000 + n),
+      Contact_Phone: '02000' + (1000 + n),
+      Contact_Email: 'v' + n + '@example.com',
+      Address: 'ที่อยู่ ' + n
+    }).vendor;
+    var prices = (pricesPerVendor && pricesPerVendor[i]) || items.map(function (_, j) { return 1000 + i * 100 + j; });
+    created.push(inviteAndQuote(email, caseId, items, vendor.Vendor_ID, prices, 'QT-' + (i + 1)));
+  }
+  return created;
+}
+
+/** A Case in SOURCING with `count` complete quotations. */
+function sourcingCase(email, count) {
+  var c = caseWithItems(email);
+  var vendors = quoteVendors(email, c.caseId, c.items, count);
+  assertApiOk(moveTo(email, c.caseId, 'SOURCING'), 'move to SOURCING');
+  return { caseId: c.caseId, items: c.items, caseVendors: vendors };
+}
+
+test('T3 three complete quotations allow sourcing to be declared finished', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(bundle.rules.quotes.valid, 3, 'three usable quotations');
+    assertEquals(bundle.rules.quotes.required, 3, 'the configured minimum');
+    assertEquals(bundle.rules.blockers.length, 0, 'nothing blocking');
+    assert(bundle.nextStatuses.some(function (s) { return s.code === 'SOURCING_DONE'; }),
+      'the button is offered');
+
+    var result = assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+    assertEquals(result.caseRecord.Status, 'SOURCING_DONE', 'moved');
+
+    var logs = logsFor('Cases', c.caseId).filter(function (l) { return l.Action === 'STATUS_CHANGE'; });
+    assertEquals(logs[logs.length - 1].New_Value, 'SOURCING_DONE', 'logged as a status change');
+  });
+});
+
+test('T4 two quotations without an approved exception cannot finish sourcing', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 2);
+
+    var error = assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'RULE_VIOLATION', 'blocked');
+    assertContains(error.message, '2', 'the message states how many were found');
+    assertEquals(error.details.quotes.valid, 2, 'the count comes back for the UI');
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING', 'the Case did not move');
+  });
+});
+
+test('T5 two quotations plus an exception approved by HEAD are enough', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 2);
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_requestException(c.caseId, 'SOLE_AGENT', ''), 'VALIDATION', 'a reason is required');
+      assertApiError(api_requestException(c.caseId, 'NOT_A_REASON', 'เหตุผล'), 'VALIDATION', 'code must be in the list');
+      assertApiOk(api_requestException(c.caseId, 'LIMITED_MARKET', 'ผู้ผลิตป้ายขนาดนี้ในประเทศมีเพียง 2 ราย'));
+    });
+    assertEquals(currentCase(c.caseId).Exception_Status, 'PENDING', 'awaiting a decision');
+
+    // Still blocked while the request is merely pending.
+    assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'RULE_VIOLATION', 'pending is not approval');
+
+    asUser(USERS.head, function () {
+      assertApiOk(api_decideException(c.caseId, true, 'ตรวจสอบแล้วตลาดมีผู้ขายจำกัดจริง'));
+    });
+    var approved = currentCase(c.caseId);
+    assertEquals(approved.Exception_Status, 'APPROVED', 'approved');
+    assertEquals(approved.Exception_Approved_By, USERS.head, 'by the head');
+    assert(!!approved.Exception_Approved_At, 'with a timestamp');
+
+    assertEquals(assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE')).caseRecord.Status,
+      'SOURCING_DONE', 'now it moves');
+
+    var exceptions = logsFor('Cases', c.caseId).filter(function (l) { return l.Action === 'EXCEPTION'; });
+    assert(exceptions.length >= 2, 'both the request and the decision are logged');
+  });
+});
+
+test('T6 a head cannot approve an exception on a Case they own', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.head, 2);
+
+    asUser(USERS.head, function () {
+      assertApiOk(api_requestException(c.caseId, 'URGENT', 'งานเร่งด่วนตามคำสั่งผู้บริหาร'));
+      var error = assertApiError(api_decideException(c.caseId, true, 'อนุมัติเอง'), 'FORBIDDEN', 'self approval');
+      assertEquals(error.details.owner, USERS.head, 'the error names the owner');
+    });
+    assertEquals(currentCase(c.caseId).Exception_Status, 'PENDING', 'still pending');
+
+    // A buyer cannot decide at all.
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_decideException(c.caseId, true, 'อนุมัติ'), 'FORBIDDEN', 'buyers do not approve');
+    });
+  });
+});
+
+test('a rejected exception leaves the Case blocked and says so', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 2);
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_requestException(c.caseId, 'URGENT', 'ต้องติดตั้งก่อนสิ้นเดือน'));
+    });
+    asUser(USERS.head, function () {
+      assertApiOk(api_decideException(c.caseId, false, 'ยังพอมีเวลาหาผู้ขายเพิ่ม'));
+    });
+
+    assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'RULE_VIOLATION', 'still blocked');
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assert(bundle.rules.warnings.some(function (w) { return w.indexOf('ถูกปฏิเสธ') !== -1; }),
+      'the rejection is explained on the page');
+  });
+});
+
+test('zero usable quotations is blocked even with an approved exception', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING'));
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_requestException(c.caseId, 'SOLE_AGENT', 'ตัวแทนจำหน่ายรายเดียวในประเทศ'));
+    });
+    asUser(USERS.head, function () {
+      assertApiOk(api_decideException(c.caseId, true, 'ยืนยันเป็นตัวแทนรายเดียว'));
+    });
+
+    var error = assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'RULE_VIOLATION', 'nothing to compare');
+    assertContains(error.message, 'ยังไม่มีใบเสนอราคาที่ใช้ได้เลย', 'the specific reason');
+  });
+});
+
+test('an incomplete price column does not count as a usable quotation', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    quoteVendors(USERS.buyerA, c.caseId, c.items, 2);
+
+    // A third vendor quotes only one of the two items.
+    var partial = createVendorAs(USERS.buyerA, {
+      Vendor_Name: 'ผู้ขายเสนอไม่ครบ', Tax_ID: '0105500009999',
+      Contact_Phone: '029999999', Contact_Email: 'p@example.com', Address: 'ที่อยู่ พี'
+    }).vendor;
+    var cv = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_addVendorToCase(c.caseId, partial.Vendor_ID, {
+        Response_Status: 'QUOTED', Quote_No: 'QT-3', Quote_Date: '2026-01-25'
+      })).caseVendor;
+    });
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit: 'SET', Vendor_Unit_Price: 900 }
+      ]));
+    });
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING'));
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(bundle.rules.quotes.valid, 2, 'the partial quotation does not count');
+    assert(bundle.rules.quotes.rejectedVendors.some(function (r) {
+      return r.reason === Rules.REJECTION_REASONS.INCOMPLETE_PRICING;
+    }), 'and the reason is spelled out');
+
+    // Turning the setting off makes it count.
+    Config.setSetting('REQUIRE_ALL_ITEMS_PRICED', 'FALSE');
+    var relaxed = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(relaxed.rules.quotes.valid, 3, 'now it counts');
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'and sourcing can finish');
+  });
+});
+
+test('T7 an expiring quotation reverts a finished Case back to sourcing', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+
+    // One quotation is given an expiry date in the past.
+    var cv = c.caseVendors[0];
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_updateCaseVendor(cv.Case_Vendor_ID, { Quote_Valid_Until: '2020-12-31' },
+        Repository.requireById('Case_Vendors', cv.Case_Vendor_ID).Version, 'ผู้ขายยืนราคาถึงสิ้นปีเท่านั้น'));
+    });
+
+    var after = currentCase(c.caseId);
+    assertEquals(after.Status, 'SOURCING', 'the Case fell back automatically');
+
+    var reverts = logsFor('Cases', c.caseId).filter(function (l) {
+      return l.Action === 'STATUS_CHANGE' && l.New_Value === 'SOURCING' && l.User === 'SYSTEM';
+    });
+    assertEquals(reverts.length, 1, 'logged once, attributed to SYSTEM');
+    assertContains(reverts[0].Reason, 'ย้อนสถานะ', 'and says why');
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(bundle.rules.quotes.valid, 2, 'the expired quotation no longer counts');
+    assert(bundle.rules.quotes.rejectedVendors.some(function (r) {
+      return r.reason === Rules.REJECTION_REASONS.EXPIRED;
+    }), 'and it is listed as expired');
+  });
+});
+
+test('T8b a vendor withdrawing reverts a finished Case back to sourcing', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+
+    var cv = c.caseVendors[2];
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_updateCaseVendor(cv.Case_Vendor_ID, { Response_Status: 'WITHDRAWN' },
+        Repository.requireById('Case_Vendors', cv.Case_Vendor_ID).Version, 'ผู้ขายแจ้งถอนตัว'));
+    });
+
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING', 'reverted');
+    assert(result.warnings.some(function (w) { return w.indexOf('ย้อนสถานะ') !== -1; }),
+      'the buyer is told on the spot');
+  });
+});
+
+test('deleting an item can also trigger the revert', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+
+    // Adding an unpriced item makes every quotation incomplete.
+    addItem(USERS.buyerA, c.caseId, { Item_Description: 'รายการที่เพิ่งเพิ่ม', Quantity: 1, Unit: 'JOB' });
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING', 'reverted after the item was added');
+  });
+});
+
+test('a buyer may only cancel their own Case while it is still in INTAKE', function () {
+  withUsers(function () {
+    var early = createCaseAs(USERS.buyerA);
+    var later = createCaseAs(USERS.buyerA, { Request_Ref: 'MEMO-2' });
+    assertApiOk(moveTo(USERS.buyerA, later, 'SOURCING'));
+
+    assertApiError(moveTo(USERS.buyerA, early, 'CANCELLED'), 'VALIDATION', 'a reason is required');
+    assertApiOk(moveTo(USERS.buyerA, early, 'CANCELLED', 'ผู้ขอยกเลิกคำขอ'));
+    assertEquals(currentCase(early).Status, 'CANCELLED', 'cancelled');
+
+    assertApiError(moveTo(USERS.buyerA, later, 'CANCELLED', 'ไม่เอาแล้ว'), 'FORBIDDEN',
+      'past INTAKE only HEAD may cancel');
+    assertApiOk(moveTo(USERS.head, later, 'CANCELLED', 'หน่วยงานถอนคำขอ'));
+
+    // A buyer may never close a Case, even from a status that allows CLOSED.
+    var third = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, third.caseId, 'SOURCING_DONE'));
+    assertApiError(moveTo(USERS.buyerA, third.caseId, 'CLOSED'), 'FORBIDDEN', 'closing belongs to HEAD');
+    assertApiOk(moveTo(USERS.head, third.caseId, 'CLOSED', 'ส่งมอบครบถ้วน'));
+  });
+});
+
+test('an illegal transition is refused even for HEAD', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var error = assertApiError(moveTo(USERS.head, caseId, 'SOURCING_DONE'), 'RULE_VIOLATION',
+      'INTAKE does not lead straight to SOURCING_DONE');
+    assertDeepEquals(error.details.allowed, ['SOURCING', 'CANCELLED'], 'the legal moves come back');
+    assertApiError(moveTo(USERS.head, caseId, 'NEGOTIATION'), 'RULE_VIOLATION', 'a reserved M5 status');
+  });
+});
+
+test('going backwards requires a reason', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+    assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING'), 'VALIDATION', 'reason required');
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING', 'ต้องหาผู้ขายเพิ่มตามที่หัวหน้าสั่ง'));
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING', 'moved back');
+  });
+});
+
+test('T14 a closed Case is frozen until HEAD reopens it', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+    assertApiOk(moveTo(USERS.head, c.caseId, 'CLOSED', 'ส่งมอบเรียบร้อย'));
+    assert(!!currentCase(c.caseId).Closed_At, 'Closed_At is stamped');
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_updateCase(c.caseId, { Description: 'แก้หลังปิดงาน' },
+        currentCase(c.caseId).Version), 'FORBIDDEN', 'no edits');
+      assertApiError(api_saveActivity(c.caseId, activityPayload()), 'FORBIDDEN', 'no activities either');
+      assertApiError(api_reopenCase(c.caseId, 'ขอเปิดใหม่'), 'FORBIDDEN', 'buyers cannot reopen');
+    });
+
+    asUser(USERS.head, function () {
+      assertApiError(api_reopenCase(c.caseId, ''), 'VALIDATION', 'reopen needs a reason');
+      var result = assertApiOk(api_reopenCase(c.caseId, 'หน่วยงานขอแก้ไขรายการเพิ่ม'));
+      assertEquals(result.restoredTo, 'SOURCING_DONE', 'restored to the status it held before closing');
+    });
+
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING_DONE', 'back where it was');
+    assertEquals(currentCase(c.caseId).Closed_At, null, 'Closed_At cleared');
+
+    var reopens = logsFor('Cases', c.caseId).filter(function (l) { return l.Action === 'REOPEN'; });
+    assertEquals(reopens.length, 1, 'logged as REOPEN');
+    assertEquals(reopens[0].Reason, 'หน่วยงานขอแก้ไขรายการเพิ่ม', 'with the reason');
+
+    // And it is editable again.
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_updateCase(c.caseId, { Description: 'แก้ไขหลัง reopen' }, currentCase(c.caseId).Version));
+    });
+  });
+});
+
+test('reopening a cancelled Case that never moved returns it to INTAKE', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    assertApiOk(moveTo(USERS.buyerA, caseId, 'CANCELLED', 'ผู้ขอยกเลิก'));
+    asUser(USERS.head, function () {
+      assertEquals(assertApiOk(api_reopenCase(caseId, 'ผู้ขอกลับมายืนยันว่าต้องการ')).restoredTo,
+        'INTAKE', 'back to the start');
+    });
+    asUser(USERS.head, function () {
+      assertApiError(api_reopenCase(caseId, 'อีกครั้ง'), 'VALIDATION', 'an open Case needs no reopen');
+    });
+  });
+});
+
+test('T16 a PR number can only be recorded once sourcing is finished, and only once', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    var other = sourcingCase(USERS.buyerB, 3);
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_addReference(c.caseId, { Ref_Type: 'PR', Ref_No: 'PR-2026-0001' }),
+        'RULE_VIOLATION', 'too early');
+    });
+
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+
+    asUser(USERS.buyerA, function () {
+      var saved = assertApiOk(api_addReference(c.caseId, {
+        Ref_Type: 'PR', Ref_No: 'PR-2026-0001', Ref_Date: '2026-02-01', Amount: 250000
+      })).reference;
+      assertEquals(saved.Ref_Type, 'PR', 'stored as a PR');
+
+      // One Case may carry several PR numbers (SPEC §14.3).
+      assertApiOk(api_addReference(c.caseId, { Ref_Type: 'PR', Ref_No: 'PR-2026-0002' }));
+
+      // PO and GR are reserved for later modules.
+      assertApiError(api_addReference(c.caseId, { Ref_Type: 'PO', Ref_No: 'PO-1' }),
+        'RULE_VIOLATION', 'PO is reserved');
+    });
+
+    assertApiOk(moveTo(USERS.buyerB, other.caseId, 'SOURCING_DONE'));
+    asUser(USERS.buyerB, function () {
+      var error = assertApiError(api_addReference(other.caseId, { Ref_Type: 'PR', Ref_No: 'PR-2026-0001' }),
+        'DUPLICATE', 'the same PR number on two Cases');
+      assertEquals(error.details.caseId, c.caseId, 'and it names the Case already using it');
+    });
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(bundle.references.length, 2, 'both references come back with the Case');
+  });
+});
+
+test('the Change_Log of a Case is readable by anyone who may read the Case', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+
+    var entries = asUser(USERS.auditor, function () {
+      return assertApiOk(api_getChangeLog(c.caseId)).entries;
+    });
+    assert(entries.length > 5, 'a full history is there');
+    assertEquals(entries[0].Timestamp > entries[entries.length - 1].Timestamp, true, 'newest first');
+    assert(entries.every(function (e) { return !!e.Action && !!e.User; }), 'every entry is attributed');
+
+    Config.setSetting('BUYER_CAN_VIEW_ALL', 'FALSE');
+    asUser(USERS.buyerB, function () {
+      assertApiError(api_getChangeLog(c.caseId), 'FORBIDDEN', 'not readable if the Case is not');
+    });
+  });
+});
+
+test('a module can register its own transition rule without touching Rules.js', function () {
+  withUsers(function () {
+    var calls = [];
+    StatusEngine.registerRule('INTAKE', 'SOURCING', function (ctx) {
+      calls.push(ctx.to);
+      throw Err.ruleViolation('กฎของโมดูลสมมติ: ยังเริ่มหา Vendor ไม่ได้');
+    });
+    try {
+      var caseId = createCaseAs(USERS.buyerA);
+      var error = assertApiError(moveTo(USERS.buyerA, caseId, 'SOURCING'), 'RULE_VIOLATION', 'the new rule ran');
+      assertContains(error.message, 'โมดูลสมมติ', 'and its message is what the user sees');
+      assertEquals(calls.length, 1, 'called once');
+      assertEquals(currentCase(caseId).Status, 'INTAKE', 'the Case did not move');
+    } finally {
+      // Put the registry back the way Rules.js left it.
+      StatusEngine.__resetRegistry();
+      StatusEngine.registerRule('SOURCING', 'SOURCING_DONE', Rules.minQuotes);
+      StatusEngine.registerRecheck(Rules.recheckMinQuotes);
+    }
+  });
+});

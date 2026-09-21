@@ -36,6 +36,7 @@ const LOAD_ORDER = [
   'StatusEngine.js',
   'Rules.js',
   'CaseService.js',
+  'CaseWorkflow.js',
   'ItemService.js',
   'VendorService.js',
   'QuoteService.js',

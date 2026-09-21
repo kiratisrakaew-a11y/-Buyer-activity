@@ -128,6 +128,9 @@ var DELETE_HANDLERS = {
   Case_Vendors: function (user, record, version, reason) {
     return VendorService.removeFromCase(user, record.Case_Vendor_ID, version, reason);
   },
+  Case_References: function (user, record, version, reason) {
+    return ReferenceService.remove(user, record.Case_ID, record.Ref_ID, version, reason);
+  },
   Activities: function (user, record, version, reason) {
     return ActivityService.remove(user, record.Activity_ID, version, reason);
   },
@@ -221,4 +224,69 @@ function api_setNextActionDone(activityId, done, version) {
   return handle('api_setNextActionDone', API_ROLES.BUYER_HEAD, function (user) {
     return ActivityService.setNextActionDone(user, activityId, done, version);
   });
+}
+
+/* ---------------------------------------------------- status and workflow */
+
+function api_changeStatus(caseId, toStatus, version, reason) {
+  return handle('api_changeStatus', API_ROLES.BUYER_HEAD, function (user) {
+    var result = StatusEngine.transition(user, caseId, toStatus, version, reason);
+    return Object.assign(result, { warnings: Rules.recheckCaseRules(caseId).messages });
+  });
+}
+
+function api_requestException(caseId, reasonCode, note) {
+  return handle('api_requestException', API_ROLES.BUYER_HEAD, function (user) {
+    return CaseWorkflow.requestException(user, caseId, reasonCode, note);
+  });
+}
+
+function api_decideException(caseId, approve, note) {
+  return handle('api_decideException', API_ROLES.HEAD_ONLY, function (user) {
+    return CaseWorkflow.decideException(user, caseId, approve, note);
+  });
+}
+
+function api_reassignCase(caseId, newOwnerEmail, reason) {
+  return handle('api_reassignCase', API_ROLES.HEAD_ONLY, function (user) {
+    return CaseWorkflow.reassign(user, caseId, newOwnerEmail, reason);
+  });
+}
+
+function api_reopenCase(caseId, reason) {
+  return handle('api_reopenCase', API_ROLES.HEAD_ONLY, function (user) {
+    return CaseWorkflow.reopen(user, caseId, reason);
+  });
+}
+
+/* ------------------------------------------------------------- references */
+
+function api_addReference(caseId, payload) {
+  return handle('api_addReference', API_ROLES.BUYER_HEAD, function (user) {
+    return ReferenceService.add(user, caseId, payload || {});
+  });
+}
+
+/* -------------------------------------------------------------- audit log */
+
+function api_getChangeLog(caseId) {
+  return handle('api_getChangeLog', API_ROLES.ANY, function (user) {
+    CaseService.getForView(user, caseId);        // you may read the log of a Case you may read
+    return { entries: ChangeLog.forCase(caseId).map(toLogClient) };
+  });
+}
+
+function toLogClient(entry) {
+  return {
+    Log_ID: entry.Log_ID,
+    Timestamp: entry.Timestamp instanceof Date ? entry.Timestamp.toISOString() : String(entry.Timestamp),
+    User: entry.User,
+    Table_Name: entry.Table_Name,
+    Record_ID: entry.Record_ID,
+    Action: entry.Action,
+    Field: entry.Field,
+    Old_Value: entry.Old_Value,
+    New_Value: entry.New_Value,
+    Reason: entry.Reason
+  };
 }
