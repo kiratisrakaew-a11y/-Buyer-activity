@@ -950,3 +950,337 @@ test('My Cases lists only what the caller may see and flags overdue next actions
     assertEquals(byStatus.cases.length, 0, 'status filter');
   });
 });
+
+/* ============================================================================
+ * Phase 5 — Vendor master, vendors on a Case, the price matrix
+ * ==========================================================================*/
+
+function vendorPayload(overrides) {
+  return Object.assign({
+    Vendor_Name: 'บริษัท ป้ายไทย จำกัด',
+    Tax_ID: '0105500000001',
+    Address: '99 ถนนพระราม 9 กรุงเทพฯ',
+    Contact_Name: 'คุณมานี',
+    Contact_Phone: '021112222',
+    Contact_Email: 'sales@paithai.example',
+    Categories: 'BILLBOARD,STEEL'
+  }, overrides || {});
+}
+
+function createVendorAs(email, overrides) {
+  return asUser(email, function () {
+    return assertApiOk(api_createVendor(vendorPayload(overrides)));
+  });
+}
+
+/** A Case with two items, ready for vendors to be priced against. */
+function caseWithItems(email) {
+  var caseId = createCaseAs(email);
+  var a = addItem(email, caseId, { Item_Description: 'โครงสร้างเหล็ก', Quantity: 2, Unit: 'SET' });
+  var b = addItem(email, caseId, { Item_Description: 'งานติดตั้ง', Quantity: 1, Unit: 'JOB' });
+  return { caseId: caseId, items: [a, b] };
+}
+
+/** Invites a vendor and prices every item, i.e. produces a valid quotation. */
+function inviteAndQuote(email, caseId, items, vendorId, prices, quoteNo) {
+  return asUser(email, function () {
+    var cv = assertApiOk(api_addVendorToCase(caseId, vendorId, {
+      Invited_Date: '2026-01-20',
+      Invite_Channel: 'EMAIL',
+      Response_Status: 'QUOTED',
+      Quote_No: quoteNo || 'QT-001',
+      Quote_Date: '2026-01-25'
+    })).caseVendor;
+
+    assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, items.map(function (item, i) {
+      return { Item_Row_ID: item.Item_Row_ID, Vendor_Unit: item.Unit, Vendor_Unit_Price: prices[i] };
+    })));
+    return cv;
+  });
+}
+
+test('T9 a duplicate Tax_ID is blocked and a duplicate phone only warns', function () {
+  withUsers(function () {
+    var first = createVendorAs(USERS.buyerA);
+    assertDeepEquals(first.warnings, [], 'the first vendor is clean');
+    assertEquals(first.vendor.Vendor_Status, 'NEW', 'buyers create vendors as NEW');
+
+    asUser(USERS.buyerA, function () {
+      var error = assertApiError(api_createVendor(vendorPayload({ Vendor_Name: 'ชื่ออื่น' })),
+        'DUPLICATE', 'same Tax_ID is blocked');
+      assertEquals(error.details.existing.Vendor_ID, first.vendor.Vendor_ID, 'the existing vendor is offered');
+    });
+
+    // Same phone, different Tax_ID: a red flag the buyer must see, not a block.
+    var second = createVendorAs(USERS.buyerA, {
+      Vendor_Name: 'บริษัท ป้ายไทย 2 จำกัด',
+      Tax_ID: '0105500000002',
+      Address: 'ที่อยู่อื่น',
+      Contact_Email: 'other@paithai.example'
+    });
+    assertEquals(second.warnings.length, 1, 'one warning');
+    assertContains(second.warnings[0], 'เบอร์โทรศัพท์', 'about the phone number');
+    assertContains(second.warnings[0], 'บริษัท ป้ายไทย จำกัด', 'naming the other vendor');
+    assert(!!second.vendor.Vendor_ID, 'but the vendor was created');
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_createVendor(vendorPayload({ Tax_ID: '123' })), 'VALIDATION', 'Tax_ID must be 13 digits');
+    });
+    // Formatting characters are stripped before the uniqueness check.
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_createVendor(vendorPayload({ Tax_ID: '0-105-500-000001' })),
+        'DUPLICATE', 'dashes do not create a new vendor');
+    });
+  });
+});
+
+test('only an administrator may approve or blacklist a vendor', function () {
+  withUsers(function () {
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_updateVendor(vendor.Vendor_ID, { Vendor_Status: 'APPROVED' }, 1), 'FORBIDDEN', 'buyer');
+    });
+    asUser(USERS.head, function () {
+      assertApiError(api_updateVendor(vendor.Vendor_ID, { Vendor_Status: 'BLACKLIST' }, 1), 'FORBIDDEN', 'head');
+    });
+    asUser(USERS.admin, function () {
+      assertApiOk(api_updateVendor(vendor.Vendor_ID, { Vendor_Status: 'APPROVED' }, 1, 'ตรวจเอกสารครบ'));
+    });
+    assertEquals(Repository.requireById('Vendors', vendor.Vendor_ID).Vendor_Status, 'APPROVED', 'applied');
+
+    // A buyer may still correct ordinary master data.
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_updateVendor(vendor.Vendor_ID, { Contact_Name: 'คุณสมหญิง' }, 2));
+    });
+  });
+});
+
+test('a blacklisted vendor cannot be invited, and no vendor twice', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+    asUser(USERS.admin, function () {
+      assertApiOk(api_updateVendor(vendor.Vendor_ID, { Vendor_Status: 'BLACKLIST' }, 1, 'สมยอมราคา'));
+    });
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_addVendorToCase(caseId, vendor.Vendor_ID, {}), 'RULE_VIOLATION', 'blacklisted');
+    });
+
+    var ok = createVendorAs(USERS.buyerA, { Tax_ID: '0105500000009', Vendor_Name: 'ผู้ขายปกติ',
+      Contact_Phone: '029990000', Contact_Email: 'a@b.example', Address: 'ที่อยู่ ก' }).vendor;
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_addVendorToCase(caseId, ok.Vendor_ID, {}));
+      assertApiError(api_addVendorToCase(caseId, ok.Vendor_ID, {}), 'DUPLICATE', 'same vendor twice');
+    });
+  });
+});
+
+test('marking a vendor QUOTED requires the quotation number and date', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_addVendorToCase(caseId, vendor.Vendor_ID, { Response_Status: 'QUOTED' }),
+        'VALIDATION', 'quote number required');
+
+      var cv = assertApiOk(api_addVendorToCase(caseId, vendor.Vendor_ID, {
+        Response_Status: 'INVITED', Invite_Channel: 'EMAIL'
+      })).caseVendor;
+      assertEquals(cv.Qualification_Status, 'NOT_CHECKED', 'qualification starts unchecked (M6 reserved)');
+
+      assertApiError(api_updateCaseVendor(cv.Case_Vendor_ID, { Response_Status: 'QUOTED' }, 1, 'ได้รับใบเสนอราคา'),
+        'VALIDATION', 'still needs the quote number');
+
+      assertApiOk(api_updateCaseVendor(cv.Case_Vendor_ID, {
+        Response_Status: 'QUOTED', Quote_No: 'QT-2026-1', Quote_Date: '2026-01-25'
+      }, 1, 'ได้รับใบเสนอราคาทางอีเมล'));
+    });
+  });
+});
+
+test('T8 changing Response_Status needs a reason and is logged as STATUS_CHANGE', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+    var cv = inviteAndQuote(USERS.buyerA, c.caseId, c.items, vendor.Vendor_ID, [1000, 2000]);
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_updateCaseVendor(cv.Case_Vendor_ID, { Response_Status: 'WITHDRAWN' }, 1),
+        'VALIDATION', 'a reason is mandatory');
+      assertApiOk(api_updateCaseVendor(cv.Case_Vendor_ID, { Response_Status: 'WITHDRAWN' }, 1,
+        'ผู้ขายแจ้งถอนตัวทางโทรศัพท์'));
+    });
+
+    var logs = logsFor('Case_Vendors', cv.Case_Vendor_ID);
+    var change = logs.filter(function (l) { return l.Field === 'Response_Status'; })[0];
+    assertEquals(change.Action, 'STATUS_CHANGE', 'labelled as a status change');
+    assertEquals(change.Old_Value, 'QUOTED', 'old value');
+    assertEquals(change.New_Value, 'WITHDRAWN', 'new value');
+    assertEquals(change.Reason, 'ผู้ขายแจ้งถอนตัวทางโทรศัพท์', 'reason kept');
+  });
+});
+
+test('the price matrix saves a whole column, computes totals and marks the cheapest', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var v1 = createVendorAs(USERS.buyerA, { Vendor_Name: 'ผู้ขาย 1', Tax_ID: '0105500000001' }).vendor;
+    var v2 = createVendorAs(USERS.buyerA, {
+      Vendor_Name: 'ผู้ขาย 2', Tax_ID: '0105500000002',
+      Contact_Phone: '022220000', Contact_Email: 'v2@x.example', Address: 'ที่อยู่ 2'
+    }).vendor;
+
+    inviteAndQuote(USERS.buyerA, c.caseId, c.items, v1.Vendor_ID, [1000, 5000], 'QT-1');
+    inviteAndQuote(USERS.buyerA, c.caseId, c.items, v2.Vendor_ID, [1200, 4000], 'QT-2');
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(bundle.vendors.length, 2, 'both vendors on the Case');
+
+    // Quantity 2 x 1000 + quantity 1 x 5000
+    assertEquals(bundle.vendors[0].grandTotal, 7000, 'vendor 1 total');
+    assertEquals(bundle.vendors[1].grandTotal, 6400, 'vendor 2 total');
+    assertEquals(bundle.vendors[0].lines[0].lineTotal, 2000, 'line total is quantity x unit price');
+
+    assertEquals(bundle.lowestPricePerItem[c.items[0].Item_Row_ID], 1000, 'cheapest on item 1');
+    assertEquals(bundle.lowestPricePerItem[c.items[1].Item_Row_ID], 4000, 'cheapest on item 2');
+
+    // Nothing computed is stored.
+    var stored = Repository.queryByCase('Quote_Lines', c.caseId)[0];
+    assertEquals(stored.lineTotal, undefined, 'no total column in the sheet');
+  });
+});
+
+test('T12b editing a saved price requires a reason; adding a new one does not', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+
+    var cv = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_addVendorToCase(c.caseId, vendor.Vendor_ID, {
+        Response_Status: 'QUOTED', Quote_No: 'QT-1', Quote_Date: '2026-01-25'
+      })).caseVendor;
+    });
+
+    // First entry of a price is not an edit, so no reason is needed.
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit: 'SET', Vendor_Unit_Price: 1000 }
+      ]));
+    });
+
+    var line = Repository.query('Quote_Lines', { indexColumn: 'Case_Vendor_ID', indexValue: cv.Case_Vendor_ID })[0];
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit: 'SET', Vendor_Unit_Price: 1500, Version: line.Version }
+      ]), 'VALIDATION', 'changing a price needs a reason');
+
+      assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit: 'SET', Vendor_Unit_Price: 1500, Version: line.Version }
+      ], 'ผู้ขายส่งใบเสนอราคาฉบับแก้ไข'));
+    });
+
+    var logs = logsFor('Quote_Lines', line.Quote_Line_ID)
+      .filter(function (l) { return l.Field === 'Vendor_Unit_Price'; });
+    assertEquals(logs.length, 1, 'one price change logged');
+    assertEquals(logs[0].Old_Value, '1000', 'old price');
+    assertEquals(logs[0].New_Value, '1500', 'new price');
+    assertEquals(logs[0].Reason, 'ผู้ขายส่งใบเสนอราคาฉบับแก้ไข', 'reason kept');
+  });
+});
+
+test('a vendor quoting in a different unit produces a warning but saves', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+    var cv = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_addVendorToCase(c.caseId, vendor.Vendor_ID, {})).caseVendor;
+    });
+
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit: 'SQM', Vendor_Unit_Price: 800 }
+      ]));
+    });
+    assert(result.warnings.some(function (w) { return w.indexOf('หน่วย') !== -1; }), 'unit mismatch warned');
+    assertEquals(Repository.query('Quote_Lines', { indexColumn: 'Case_Vendor_ID', indexValue: cv.Case_Vendor_ID }).length,
+      1, 'the line was still saved');
+  });
+});
+
+test('clearing a price removes the quote line, with a reason', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+    var cv = inviteAndQuote(USERS.buyerA, c.caseId, c.items, vendor.Vendor_ID, [1000, 2000]);
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit_Price: '' }
+      ]), 'VALIDATION', 'removing a price needs a reason');
+
+      var result = assertApiOk(api_saveQuoteLines(cv.Case_Vendor_ID, [
+        { Item_Row_ID: c.items[0].Item_Row_ID, Vendor_Unit_Price: '' }
+      ], 'ผู้ขายแจ้งว่าไม่เสนอรายการนี้'));
+      assertEquals(result.removed, 1, 'one line removed');
+    });
+    assertEquals(Repository.query('Quote_Lines', { indexColumn: 'Case_Vendor_ID', indexValue: cv.Case_Vendor_ID }).length,
+      1, 'the other line is untouched');
+  });
+});
+
+test('removing a vendor from a Case takes its prices with it', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA).vendor;
+    var cv = inviteAndQuote(USERS.buyerA, c.caseId, c.items, vendor.Vendor_ID, [1000, 2000]);
+
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_deleteRecord('Case_Vendors', cv.Case_Vendor_ID, 1, 'เพิ่มผิดงาน'));
+    });
+    assertEquals(result.deletedQuoteLines, 2, 'both prices cascaded');
+    assertEquals(Repository.queryByCase('Case_Vendors', c.caseId).length, 0, 'vendor gone from the Case');
+    assertEquals(Repository.queryByCase('Quote_Lines', c.caseId).length, 0, 'prices gone too');
+    // The vendor master record is untouched.
+    assert(!!Repository.findById('Vendors', vendor.Vendor_ID), 'the vendor still exists in the master');
+  });
+});
+
+test('vendor search and history', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var vendor = createVendorAs(USERS.buyerA, { Vendor_Name: 'บริษัท เมกะไซน์ จำกัด' }).vendor;
+    inviteAndQuote(USERS.buyerA, c.caseId, c.items, vendor.Vendor_ID, [100, 200], 'QT-7');
+
+    asUser(USERS.buyerA, function () {
+      assertEquals(assertApiOk(api_searchVendors('เมกะ')).vendors.length, 1, 'by name');
+      assertEquals(assertApiOk(api_searchVendors('0105500000001')).vendors.length, 1, 'by tax id');
+      assertEquals(assertApiOk(api_searchVendors('ไม่มีอยู่จริง')).vendors.length, 0, 'no match');
+
+      var history = assertApiOk(api_getVendorHistory(vendor.Vendor_ID)).history;
+      assertEquals(history.length, 1, 'one Case in the history');
+      assertEquals(history[0].Case_ID, c.caseId, 'the right Case');
+      assertEquals(history[0].Quote_No, 'QT-7', 'with its quotation number');
+    });
+  });
+});
+
+test('an upload lands in the Case folder and is shared inside the domain only', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var base64 = Utilities.base64Encode([80, 68, 70]);
+
+    var file = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_uploadFile(caseId, 'ใบเสนอราคา QT-1.pdf', 'application/pdf', base64));
+    });
+    assert(!!file.url, 'a URL comes back for Quote_File_URL');
+    assertEquals(DriveApp.getFileById(file.fileId).sharing.access, 'DOMAIN', 'domain sharing');
+
+    asUser(USERS.buyerB, function () {
+      assertApiError(api_uploadFile(caseId, 'x.pdf', 'application/pdf', base64),
+        'FORBIDDEN', 'not the owner');
+    });
+  });
+});

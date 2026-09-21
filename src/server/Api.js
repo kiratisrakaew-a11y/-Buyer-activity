@@ -124,6 +124,19 @@ function api_saveItem(caseId, item, version, reason) {
 var DELETE_HANDLERS = {
   Case_Items: function (user, record, version, reason) {
     return ItemService.remove(user, record.Case_ID, record.Item_Row_ID, version, reason);
+  },
+  Case_Vendors: function (user, record, version, reason) {
+    return VendorService.removeFromCase(user, record.Case_Vendor_ID, version, reason);
+  },
+  Quote_Lines: function (user, record, version, reason) {
+    CaseService.getForEdit(user, record.Case_ID);
+    var explained = Validation.requireReason(reason, 'การลบราคาที่ผู้ขายเสนอ');
+    Repository.softDelete('Quote_Lines', record.Quote_Line_ID, version, {
+      actor: user.email, reason: explained, caseId: record.Case_ID
+    });
+    return {
+      warnings: typeof Rules === 'undefined' ? [] : Rules.recheckCaseRules(record.Case_ID).messages
+    };
   }
 };
 
@@ -135,5 +148,60 @@ function api_deleteRecord(tableName, recordId, version, reason) {
     }
     var record = Repository.requireById(tableName, recordId);
     return deleter(user, record, version, reason);
+  });
+}
+
+/* --------------------------------------------------------------- vendors */
+
+function api_searchVendors(query) {
+  return handle('api_searchVendors', API_ROLES.ANY, function () {
+    return { vendors: VendorService.search(query) };
+  });
+}
+
+function api_getVendorHistory(vendorId) {
+  return handle('api_getVendorHistory', API_ROLES.ANY, function () {
+    return { history: VendorService.history(vendorId) };
+  });
+}
+
+function api_createVendor(payload) {
+  return handle('api_createVendor', API_ROLES.VENDOR_EDITORS, function (user) {
+    return VendorService.create(user, payload || {});
+  });
+}
+
+function api_updateVendor(vendorId, patch, version, reason) {
+  return handle('api_updateVendor', API_ROLES.VENDOR_EDITORS, function (user) {
+    return VendorService.update(user, vendorId, patch || {}, version, reason);
+  });
+}
+
+function api_addVendorToCase(caseId, vendorId, payload) {
+  return handle('api_addVendorToCase', API_ROLES.BUYER_HEAD, function (user) {
+    return VendorService.addToCase(user, caseId, vendorId, payload || {});
+  });
+}
+
+function api_updateCaseVendor(caseVendorId, patch, version, reason) {
+  return handle('api_updateCaseVendor', API_ROLES.BUYER_HEAD, function (user) {
+    return VendorService.updateCaseVendor(user, caseVendorId, patch || {}, version, reason);
+  });
+}
+
+/* ------------------------------------------------------------ quote lines */
+
+function api_saveQuoteLines(caseVendorId, lines, reason) {
+  return handle('api_saveQuoteLines', API_ROLES.BUYER_HEAD, function (user) {
+    return QuoteService.saveLines(user, caseVendorId, lines || [], reason);
+  });
+}
+
+/* --------------------------------------------------------------- uploads */
+
+function api_uploadFile(caseId, fileName, mimeType, base64) {
+  return handle('api_uploadFile', API_ROLES.BUYER_HEAD, function (user) {
+    var caseRecord = CaseService.getForEdit(user, caseId);
+    return DriveService.uploadToCase(caseRecord, fileName, mimeType, base64);
   });
 }
