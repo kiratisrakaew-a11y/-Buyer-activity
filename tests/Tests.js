@@ -2473,3 +2473,43 @@ if (typeof __test !== 'undefined') {
       'these controls are bound without checking they exist: ' + offenders.join(', '));
   });
 }
+
+/* ============================================================================
+ * Writes must reach the sheet before the lock is handed to the next execution
+ *
+ * Apps Script buffers writes and chooses when to send them. Releasing the script
+ * lock without forcing them out first makes the lock decorative: the next
+ * execution acquires it, reads the counter, and sees the value the previous one
+ * had already replaced — so two Cases receive the same Case_ID. That is exactly
+ * what happened on the first real deployment, where one Case_ID came back nine
+ * times after the create button was clicked in quick succession.
+ *
+ * The mock writes synchronously and cannot reproduce the buffering, so it checks
+ * the contract instead: flush is called while the lock is still held.
+ * ==========================================================================*/
+
+if (typeof __test !== 'undefined') {
+
+  test('T2b every locked write is flushed before the lock is released', function () {
+    withFreshDatabase(function () {
+      __test.clearLockEvents();
+      IdGenerator.next('Cases');
+      assertEquals(__test.lockEvents.join(' '), 'tryLock flush releaseLock',
+        'minting an id must flush inside the lock');
+
+      // The same has to hold for the repository, which is where every other
+      // write in the system goes.
+      __test.clearLockEvents();
+      Repository.insert('Vendors', {
+        Vendor_Name: 'ผู้ขายทดสอบ flush', Tax_ID: '0105512340001', Vendor_Status: 'NEW'
+      }, { actor: 'buyer.a@example.com' });
+
+      var events = __test.lockEvents;
+      var lastFlush = events.lastIndexOf('flush');
+      var lastRelease = events.lastIndexOf('releaseLock');
+      assert(lastFlush !== -1, 'an insert flushes at all');
+      assert(lastFlush < lastRelease, 'and the flush comes before the release — got ' + events.join(' '));
+      assertEquals(events[events.length - 1], 'releaseLock', 'the release is last');
+    });
+  });
+}

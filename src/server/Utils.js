@@ -32,6 +32,18 @@ var Utils = (function () {
       return fn();
     } finally {
       lockDepth--;
+      // Apps Script buffers writes and decides for itself when to send them.
+      // Releasing the lock without forcing them out first makes the lock
+      // useless: the next execution takes the lock, reads the sheet, and sees
+      // the value this one already replaced. That is how two Cases end up
+      // sharing a Case_ID. Flush while the lock is still held, so whoever takes
+      // it next reads what this execution actually wrote.
+      try {
+        SpreadsheetApp.flush();
+      } catch (e) {
+        console.error('SpreadsheetApp.flush() failed before releasing the lock: ' +
+          ((e && e.message) || e));
+      }
       lock.releaseLock();
     }
   }

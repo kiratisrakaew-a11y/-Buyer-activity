@@ -340,6 +340,10 @@ function createGasEnvironment() {
   let activeUserEmail = 'system@example.com';
   let effectiveUserEmail = 'system@example.com';
   let lockHeld = false;
+  // Ordered record of lock and flush calls. The mock writes synchronously, so it
+  // cannot reproduce Apps Script's write buffering; what it CAN check is that the
+  // application flushes before it lets go of the lock.
+  const lockEvents = [];
 
   const SpreadsheetApp = {
     create(name) {
@@ -354,7 +358,7 @@ function createGasEnvironment() {
       return spreadsheets[id];
     },
     getActiveSpreadsheet() { return null; },
-    flush() {}
+    flush() { lockEvents.push('flush'); }
   };
 
   const propertyStore = {
@@ -389,10 +393,11 @@ function createGasEnvironment() {
           // held means the application failed to release, which must surface.
           if (lockHeld) return false;
           lockHeld = true;
+          lockEvents.push('tryLock');
           return true;
         },
-        waitLock: () => { lockHeld = true; },
-        releaseLock: () => { lockHeld = false; },
+        waitLock: () => { lockHeld = true; lockEvents.push('waitLock'); },
+        releaseLock: () => { lockHeld = false; lockEvents.push('releaseLock'); },
         hasLock: () => lockHeld
       };
     },
@@ -559,6 +564,8 @@ function createGasEnvironment() {
         Object.keys(files).forEach((k) => { htmlFiles[k] = files[k]; });
       },
       htmlFileNames() { return Object.keys(htmlFiles); },
+      lockEvents,
+      clearLockEvents() { lockEvents.length = 0; },
       getActiveUser() { return activeUserEmail; },
       sentMail,
       clearMail() { sentMail.length = 0; },

@@ -52,6 +52,19 @@ var App = (function () {
     if (bar) bar.style.display = pending > 0 ? 'block' : 'none';
   }
 
+  /** Runs fn once every in-flight server call has settled. */
+  function whenIdle(fn) {
+    if (pending === 0) {
+      setTimeout(fn, 0);
+      return;
+    }
+    var timer = setInterval(function () {
+      if (pending > 0) return;
+      clearInterval(timer);
+      fn();
+    }, 120);
+  }
+
   /* -------------------------------------------------------------- formatting */
 
   function esc(value) {
@@ -190,9 +203,20 @@ var App = (function () {
     backdrop.onclick = function (e) { if (e.target === backdrop) close(); };
 
     var form = backdrop.querySelector('form');
+    var submitButton = form.querySelector('button[type="submit"]');
+
     form.onsubmit = function (e) {
       e.preventDefault();
+      // Pressing save again while the first request is still in flight sends a
+      // second one. Each is a separate server execution creating its own record,
+      // so an impatient double-click quietly produces duplicate work. The button
+      // stays disabled until everything in flight has settled.
+      if (submitButton.disabled) return;
+      submitButton.disabled = true;
       options.onSubmit(form, close);
+      whenIdle(function () {
+        if (document.body.contains(backdrop)) submitButton.disabled = false;
+      });
     };
     if (options.onOpen) options.onOpen(form, close);
     var first = form.querySelector('input, select, textarea');
