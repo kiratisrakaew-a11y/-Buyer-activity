@@ -1284,3 +1284,164 @@ test('an upload lands in the Case folder and is shared inside the domain only', 
     });
   });
 });
+
+/* ============================================================================
+ * Phase 6 — Activities
+ * ==========================================================================*/
+
+function activityPayload(overrides) {
+  return Object.assign({
+    Activity_Type: 'EMAIL_RFQ',
+    Channel: 'EMAIL',
+    Activity_Description: 'ส่งอีเมลขอใบเสนอราคาไปยังผู้ขาย 3 ราย',
+    Activity_Date: '2026-01-20T09:30:00.000Z'
+  }, overrides || {});
+}
+
+test('T10b a buyer may record an activity on a colleague\'s Case, as themselves', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+
+    var saved = asUser(USERS.buyerB, function () {
+      return assertApiOk(api_saveActivity(caseId, activityPayload())).activity;
+    });
+
+    assertEquals(saved.Performed_By, USERS.buyerB, 'recorded against the person who did it');
+    assertEquals(saved.Module, 'M1', 'tagged with the module');
+    assertEquals(saved.Created_By, USERS.buyerB, 'and in the audit columns');
+
+    // Buyer B still cannot edit the Case itself.
+    asUser(USERS.buyerB, function () {
+      assertApiError(api_updateCase(caseId, { Description: 'แก้' }, 1), 'FORBIDDEN', 'still no case edit');
+    });
+  });
+});
+
+test('Performed_By cannot be spoofed from the client', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var saved = asUser(USERS.buyerB, function () {
+      return assertApiOk(api_saveActivity(caseId, activityPayload({
+        Performed_By: USERS.head, Module: 'M6', Case_ID: 'SRC-9999-0001'
+      }))).activity;
+    });
+    assertEquals(saved.Performed_By, USERS.buyerB, 'the client value is ignored');
+    assertEquals(saved.Module, 'M1', 'module is set by the server');
+    assertEquals(saved.Case_ID, caseId, 'the Case comes from the URL, not the payload');
+  });
+});
+
+test('a next action without a due date is rejected', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_saveActivity(caseId, activityPayload({ Next_Action: 'โทรตามใบเสนอราคา' })),
+        'VALIDATION', 'due date required');
+      assertApiOk(api_saveActivity(caseId, activityPayload({
+        Next_Action: 'โทรตามใบเสนอราคา', Next_Action_Date: '2026-02-01'
+      })));
+      assertApiError(api_saveActivity(caseId, activityPayload({ Activity_Type: 'NOT_A_TYPE' })),
+        'VALIDATION', 'activity type must be in Config_Lists');
+    });
+  });
+});
+
+test('an activity may only name a vendor that was invited to the Case', function () {
+  withUsers(function () {
+    var c = caseWithItems(USERS.buyerA);
+    var invited = createVendorAs(USERS.buyerA).vendor;
+    var stranger = createVendorAs(USERS.buyerA, {
+      Tax_ID: '0105500000077', Vendor_Name: 'ผู้ขายที่ไม่ได้เชิญ',
+      Contact_Phone: '027770000', Contact_Email: 'z@z.example', Address: 'ที่อยู่ ซี'
+    }).vendor;
+    inviteAndQuote(USERS.buyerA, c.caseId, c.items, invited.Vendor_ID, [100, 200]);
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveActivity(c.caseId, activityPayload({
+        Vendor_ID: invited.Vendor_ID, Activity_Type: 'CALL'
+      })));
+      assertApiError(api_saveActivity(c.caseId, activityPayload({ Vendor_ID: stranger.Vendor_ID })),
+        'VALIDATION', 'vendor is not on this Case');
+    });
+  });
+});
+
+test('the timeline is newest first and next actions can be ticked off', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveActivity(caseId, activityPayload({
+        Activity_Date: '2026-01-10T03:00:00.000Z', Activity_Description: 'กิจกรรมแรก'
+      })));
+      assertApiOk(api_saveActivity(caseId, activityPayload({
+        Activity_Date: '2026-01-22T03:00:00.000Z', Activity_Description: 'กิจกรรมล่าสุด',
+        Next_Action: 'ตามใบเสนอราคา', Next_Action_Date: '2026-02-05'
+      })));
+    });
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(caseId)); });
+    assertEquals(bundle.activities.length, 2, 'both activities');
+    assertEquals(bundle.activities[0].Activity_Description, 'กิจกรรมล่าสุด', 'newest first');
+
+    var latest = bundle.activities[0];
+    asUser(USERS.buyerA, function () {
+      var done = assertApiOk(api_setNextActionDone(latest.Activity_ID, true, latest.Version)).activity;
+      assertEquals(done.Next_Action_Done, true, 'ticked');
+    });
+
+    // A completed next action no longer appears on My Cases.
+    var list = asUser(USERS.buyerA, function () { return assertApiOk(api_listCases({ scope: 'mine' })); });
+    assertEquals(list.cases[0].nextAction, null, 'nothing outstanding');
+  });
+});
+
+test('a buyer may correct their own activity but not someone else\'s', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var byB = asUser(USERS.buyerB, function () {
+      return assertApiOk(api_saveActivity(caseId, activityPayload())).activity;
+    });
+    var byA = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_saveActivity(caseId, activityPayload({ Activity_Description: 'ของเอ' }))).activity;
+    });
+
+    // B fixes their own typo, on someone else's Case.
+    asUser(USERS.buyerB, function () {
+      assertApiOk(api_saveActivity(caseId, {
+        Activity_ID: byB.Activity_ID, Activity_Description: 'แก้คำผิด'
+      }, byB.Version));
+      assertApiError(api_saveActivity(caseId, {
+        Activity_ID: byA.Activity_ID, Activity_Description: 'แก้ของคนอื่น'
+      }, byA.Version), 'FORBIDDEN', 'not B\'s entry and not B\'s Case');
+    });
+
+    // The Case owner may edit anything on their own Case.
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveActivity(caseId, {
+        Activity_ID: byB.Activity_ID, Channel: 'PHONE'
+      }, byB.Version + 1));
+    });
+    assertEquals(Repository.requireById('Activities', byB.Activity_ID).Performed_By, USERS.buyerB,
+      'editing never rewrites who performed it');
+  });
+});
+
+test('deleting an activity is a soft delete with a reason', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var activity = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_saveActivity(caseId, activityPayload())).activity;
+    });
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_deleteRecord('Activities', activity.Activity_ID, activity.Version, ''),
+        'VALIDATION', 'reason required');
+      assertApiOk(api_deleteRecord('Activities', activity.Activity_ID, activity.Version, 'บันทึกผิดงาน'));
+    });
+
+    assertEquals(Repository.queryByCase('Activities', caseId).length, 0, 'hidden');
+    assert(!!Repository.findById('Activities', activity.Activity_ID, { includeDeleted: true }),
+      'but still in the sheet for audit');
+  });
+});

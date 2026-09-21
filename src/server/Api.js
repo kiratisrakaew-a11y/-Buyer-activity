@@ -128,6 +128,9 @@ var DELETE_HANDLERS = {
   Case_Vendors: function (user, record, version, reason) {
     return VendorService.removeFromCase(user, record.Case_Vendor_ID, version, reason);
   },
+  Activities: function (user, record, version, reason) {
+    return ActivityService.remove(user, record.Activity_ID, version, reason);
+  },
   Quote_Lines: function (user, record, version, reason) {
     CaseService.getForEdit(user, record.Case_ID);
     var explained = Validation.requireReason(reason, 'การลบราคาที่ผู้ขายเสนอ');
@@ -203,5 +206,19 @@ function api_uploadFile(caseId, fileName, mimeType, base64) {
   return handle('api_uploadFile', API_ROLES.BUYER_HEAD, function (user) {
     var caseRecord = CaseService.getForEdit(user, caseId);
     return DriveService.uploadToCase(caseRecord, fileName, mimeType, base64);
+  });
+}
+
+/* ------------------------------------------------------------- activities */
+
+function api_saveActivity(caseId, activity, version) {
+  return handle('api_saveActivity', API_ROLES.BUYER_HEAD, function (user) {
+    return ActivityService.save(user, caseId, activity || {}, version);
+  });
+}
+
+function api_setNextActionDone(activityId, done, version) {
+  return handle('api_setNextActionDone', API_ROLES.BUYER_HEAD, function (user) {
+    return ActivityService.setNextActionDone(user, activityId, done, version);
   });
 }
