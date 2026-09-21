@@ -525,3 +525,137 @@ test('Change_Log has no update or delete API', function () {
     }, 'Repository refuses to update an append-only table');
   });
 });
+
+/* ============================================================================
+ * Phase 3 — Auth, roles, api envelope
+ * ==========================================================================*/
+
+var USERS = {
+  buyerA: 'buyer.a@example.com',
+  buyerB: 'buyer.b@example.com',
+  head: 'head@example.com',
+  auditor: 'auditor@example.com',
+  admin: 'admin@example.com',
+  outsider: 'nobody@example.com'
+};
+
+/** Adds the five standard people to the Users sheet of the current test database. */
+function seedUsers() {
+  [
+    [USERS.buyerA, 'บายเออร์ เอ', 'BUYER', 'CAPEX', true],
+    [USERS.buyerB, 'บายเออร์ บี', 'BUYER', 'OPEX', true],
+    [USERS.head, 'หัวหน้าจัดซื้อ', 'HEAD', '', true],
+    [USERS.auditor, 'ผู้ตรวจสอบ', 'AUDITOR', '', true],
+    [USERS.admin, 'ผู้ดูแลระบบ', 'ADMIN', '', true]
+  ].forEach(function (u) {
+    Repository.insert('Users', {
+      Email: u[0], Name: u[1], Role: u[2], Responsible_Scope: u[3], Is_Active: u[4]
+    }, { actor: 'setup' });
+  });
+}
+
+/** Runs fn while the server sees `email` as the caller. */
+function asUser(email, fn) {
+  Auth.__setUserOverride(email);
+  try {
+    return fn();
+  } finally {
+    Auth.__setUserOverride(null);
+  }
+}
+
+/** A fresh database that already has the five standard users. */
+function withUsers(fn) {
+  return withFreshDatabase(function (report) {
+    seedUsers();
+    return fn(report);
+  });
+}
+
+test('T17 a user who is not in the Users sheet is refused', function () {
+  withUsers(function () {
+    asUser(USERS.outsider, function () {
+      var error = assertApiError(api_bootstrap(), 'UNAUTHORIZED', 'unknown account');
+      assertContains(error.message, USERS.outsider, 'the message names the account');
+    });
+    // An inactive account is refused in the same way.
+    var users = Repository.readAll('Users');
+    var head = users.filter(function (u) { return u.Email === USERS.head; })[0];
+    Repository.update('Users', head.Email, { Is_Active: false }, null, { actor: 'admin' });
+    asUser(USERS.head, function () {
+      assertApiError(api_bootstrap(), 'UNAUTHORIZED', 'deactivated account');
+    });
+  });
+});
+
+test('api_bootstrap gives each role its own permission set', function () {
+  withUsers(function () {
+    var buyer = asUser(USERS.buyerA, function () { return assertApiOk(api_bootstrap()); });
+    assertEquals(buyer.user.role, 'BUYER', 'role resolved');
+    assertEquals(buyer.permissions.canCreateCase, true, 'buyer opens cases');
+    assertEquals(buyer.permissions.canApproveException, false, 'buyer cannot approve');
+    assertEquals(buyer.permissions.canSeeTeamView, false, 'buyer has no team view');
+    assertEquals(buyer.permissions.canSetVendorApproval, false, 'buyer cannot approve vendors');
+    assert(buyer.lists.BUDGET_TYPE.length > 0, 'lists are delivered for the dropdowns');
+    assert(buyer.statuses.length > 0, 'status master is delivered');
+    assertEquals(buyer.settings.MIN_QUOTES, 3, 'settings are delivered');
+
+    var head = asUser(USERS.head, function () { return assertApiOk(api_bootstrap()); });
+    assertEquals(head.permissions.canApproveException, true, 'head approves');
+    assertEquals(head.permissions.canReassign, true, 'head reassigns');
+    assertEquals(head.permissions.canEditAnyCase, true, 'head edits any case');
+
+    var auditor = asUser(USERS.auditor, function () { return assertApiOk(api_bootstrap()); });
+    assertEquals(auditor.permissions.canCreateCase, false, 'auditor does not open cases');
+    assertEquals(auditor.permissions.canEditAnyCase, false, 'auditor never edits');
+    assertEquals(auditor.permissions.canSeeTeamView, true, 'auditor sees the team view');
+
+    var admin = asUser(USERS.admin, function () { return assertApiOk(api_bootstrap()); });
+    assertEquals(admin.permissions.canSetVendorApproval, true, 'only admin approves vendors');
+    assertEquals(admin.permissions.canEditAnyCase, false, 'admin does not edit cases (SPEC 7)');
+  });
+});
+
+test('api_clearCache is restricted to ADMIN', function () {
+  withUsers(function () {
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_clearCache(), 'FORBIDDEN', 'buyer may not clear the cache');
+    });
+    asUser(USERS.head, function () {
+      assertApiError(api_clearCache(), 'FORBIDDEN', 'head may not clear the cache');
+    });
+    asUser(USERS.admin, function () {
+      assertEquals(assertApiOk(api_clearCache()).cleared, true, 'admin may');
+    });
+  });
+});
+
+test('the api envelope never leaks a stack trace', function () {
+  withUsers(function () {
+    asUser(USERS.buyerA, function () {
+      var response = handle('api_boom', null, function () {
+        throw new Error('ENOENT: secret/internal/path.js line 42');
+      });
+      assertApiError(response, 'INTERNAL', 'unexpected errors become INTERNAL');
+      assertEquals(response.error.message, 'เกิดข้อผิดพลาดภายในระบบ กรุณาลองใหม่อีกครั้ง', 'generic message');
+      assertEquals(response.error.details, null, 'no details');
+      assertEquals(JSON.stringify(response).indexOf('path.js'), -1, 'nothing internal escapes');
+    });
+  });
+});
+
+test('doGet renders the access-denied page for an unknown account', function () {
+  withUsers(function () {
+    asUser(USERS.outsider, function () {
+      var html = doGet().getContent();
+      assertContains(html, 'ไม่มีสิทธิ์เข้าใช้งาน', 'denied heading');
+      assertContains(html, USERS.outsider, 'the account is shown');
+    });
+  });
+});
+
+test('escapeHtml neutralises markup in the denied page', function () {
+  assertEquals(escapeHtml('<script>alert("x")</script>'),
+    '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;', 'tags and quotes escaped');
+  assertEquals(escapeHtml("O'Brien & Co"), 'O&#39;Brien &amp; Co', 'quote and ampersand escaped');
+});
