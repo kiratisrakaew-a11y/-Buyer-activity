@@ -308,11 +308,18 @@ var Repository = (function () {
   }
 
   /**
-   * Inserts one record. opts: { actor, reason, caseId }
-   * Returns the stored record, including its generated id and audit columns.
+   * Inserts one record. opts: { actor, reason, caseId, id }
+   * Pass `id` when the caller reserved the primary key beforehand, which lets it
+   * build dependent resources (such as a Drive folder named after the Case) and
+   * still store the record in a single version.
+   * Returns the stored record, including its audit columns.
    */
   function insert(tableName, payload, opts) {
-    return insertMany(tableName, [payload], opts)[0];
+    var options = opts || {};
+    if (options.id) {
+      options = Object.assign({}, options, { ids: [options.id] });
+    }
+    return insertMany(tableName, [payload], options)[0];
   }
 
   /** Inserts many records with one id reservation, one sheet write and one log write. */
@@ -325,7 +332,12 @@ var Repository = (function () {
       var meta = getHeaders(tableName);
       var now = Utils.now();
       var actor = options.actor || ChangeLog.SYSTEM_USER;
-      var ids = table.id ? IdGenerator.reserve(tableName, payloads.length) : [];
+      var ids = [];
+      if (table.id) {
+        ids = options.ids && options.ids.length === payloads.length
+          ? options.ids
+          : IdGenerator.reserve(tableName, payloads.length);
+      }
 
       var stored = [];
       var rows = [];

@@ -79,3 +79,61 @@ function api_clearCache() {
     return { cleared: true };
   });
 }
+
+/* ----------------------------------------------------------------- cases */
+
+function api_listCases(filter) {
+  return handle('api_listCases', API_ROLES.ANY, function (user) {
+    return CaseService.list(user, filter || {});
+  });
+}
+
+function api_getCase(caseId) {
+  return handle('api_getCase', API_ROLES.ANY, function (user) {
+    return CaseService.getBundle(user, caseId);
+  });
+}
+
+function api_createCase(payload) {
+  return handle('api_createCase', API_ROLES.BUYER_HEAD, function (user) {
+    return CaseService.create(user, payload || {});
+  });
+}
+
+function api_updateCase(caseId, patch, version, reason) {
+  return handle('api_updateCase', API_ROLES.BUYER_HEAD, function (user) {
+    return CaseService.update(user, caseId, patch || {}, version, reason);
+  });
+}
+
+/* ----------------------------------------------------------------- items */
+
+function api_saveItem(caseId, item, version, reason) {
+  return handle('api_saveItem', API_ROLES.BUYER_HEAD, function (user) {
+    return ItemService.save(user, caseId, item || {}, version, reason);
+  });
+}
+
+/* ---------------------------------------------------------------- delete */
+
+/**
+ * One delete entry point for every table (SPEC §9). The handler for a table owns
+ * its cascade, so a caller cannot delete a parent and orphan its children.
+ * A reason is always required (SPEC §6.3).
+ */
+var DELETE_HANDLERS = {
+  Case_Items: function (user, record, version, reason) {
+    return ItemService.remove(user, record.Case_ID, record.Item_Row_ID, version, reason);
+  }
+};
+
+function api_deleteRecord(tableName, recordId, version, reason) {
+  return handle('api_deleteRecord', API_ROLES.BUYER_HEAD, function (user) {
+    var deleter = DELETE_HANDLERS[tableName];
+    if (!deleter) {
+      throw Err.validation('ไม่รองรับการลบข้อมูลในตาราง ' + tableName, { table: tableName });
+    }
+    var record = Repository.requireById(tableName, recordId);
+    return deleter(user, record, version, reason);
+  });
+}

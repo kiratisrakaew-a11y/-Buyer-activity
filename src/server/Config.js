@@ -160,6 +160,28 @@ var Config = (function () {
     return get('APP_TIMEZONE', 'Asia/Bangkok');
   }
 
+  /**
+   * Writes a setting back to Config_Settings. Used only for values the system
+   * discovers for itself, such as the Drive root folder it had to create.
+   */
+  function setSetting(key, value, description) {
+    var sheet = getSheet('Config_Settings');
+    var lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      var keys = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+      for (var i = 0; i < keys.length; i++) {
+        if (String(keys[i][0]).trim() === key) {
+          sheet.getRange(i + 2, 2).setValue(value);
+          clearCache();
+          return value;
+        }
+      }
+    }
+    sheet.appendRow([key, value, description || '']);
+    clearCache();
+    return value;
+  }
+
   /* ------------------------------------------------------------------ lists */
 
   /** All active Config_Lists rows grouped by List_Name and sorted by Sort_Order. */
@@ -255,6 +277,7 @@ var Config = (function () {
     getNumber: getNumber,
     getBool: getBool,
     getTimezone: getTimezone,
+    setSetting: setSetting,
     getAllLists: getAllLists,
     getList: getList,
     isValidCode: isValidCode,

@@ -1,3 +1,316 @@
 <script>
-/* CaseDetail — filled in during the phase that owns it. */
+/**
+ * CaseDetail — the Case page and its tabs.
+ *
+ * The page itself knows nothing about the individual tabs: it renders whatever
+ * has been handed to App.registerCaseTab. A future module (Benchmark, ต่อรองราคา,
+ * ตรวจคุณสมบัติ) adds its tab from its own file and nothing here changes (SPEC §10.5).
+ */
+(function () {
+
+  var current = { caseId: null, bundle: null, tab: null };
+
+  function render(host, caseId) {
+    if (!caseId) {
+      host.innerHTML = '<div class="alert error">ไม่ได้ระบุรหัสงาน</div>';
+      return;
+    }
+    current.caseId = caseId;
+    reload(host);
+  }
+
+  function reload(host) {
+    host.innerHTML = '<div class="loading"><span class="spinner"></span> กำลังโหลดงาน…</div>';
+    App.api('api_getCase', current.caseId).then(function (bundle) {
+      current.bundle = bundle;
+      paint(host);
+    }).catch(function (error) {
+      host.innerHTML = '<div class="alert error"><strong>เปิดงานนี้ไม่ได้</strong><br>' +
+        App.esc(error.message) + '</div>';
+    });
+  }
+
+  /** Tabs and actions re-read the Case, so every screen shows the same truth. */
+  function refresh() {
+    reload(document.getElementById('app'));
+  }
+
+  function paint(host) {
+    var ctx = context();
+    var tabs = App.getCaseTabs(ctx);
+    if (!current.tab || !tabs.some(function (t) { return t.id === current.tab; })) {
+      current.tab = tabs.length ? tabs[0].id : null;
+    }
+
+    host.innerHTML =
+      header(ctx) +
+      ruleBanner(ctx) +
+      '<div class="card">' +
+        '<div class="tabs" role="tablist">' + tabs.map(function (t) {
+          return '<button type="button" role="tab" data-tab="' + App.esc(t.id) + '" aria-selected="' +
+            (t.id === current.tab) + '">' + App.esc(t.label) + '</button>';
+        }).join('') + '</div>' +
+        '<div class="card-body" id="tabBody"></div>' +
+      '</div>';
+
+    host.querySelectorAll('[data-tab]').forEach(function (b) {
+      b.onclick = function () { current.tab = b.dataset.tab; paint(host); };
+    });
+    host.querySelector('#backBtn').onclick = function () { App.go('cases'); };
+    bindHeaderActions(host, ctx);
+
+    var body = host.querySelector('#tabBody');
+    var tab = tabs.filter(function (t) { return t.id === current.tab; })[0];
+    if (tab) tab.render(body, ctx);
+  }
+
+  /** What every tab receives. `refresh` is how a tab asks the page to reload. */
+  function context() {
+    return {
+      caseId: current.caseId,
+      bundle: current.bundle,
+      caseRecord: current.bundle.caseRecord,
+      items: current.bundle.items,
+      vendors: current.bundle.vendors,
+      activities: current.bundle.activities,
+      references: current.bundle.references,
+      rules: current.bundle.rules,
+      lowestPricePerItem: current.bundle.lowestPricePerItem,
+      permissions: current.bundle.permissions,
+      canEdit: current.bundle.permissions.canEdit,
+      refresh: refresh
+    };
+  }
+
+  function header(ctx) {
+    var c = ctx.caseRecord;
+    var quotes = ctx.rules ? ctx.rules.quotes : null;
+    return '<div class="page-title">' +
+      '<button type="button" id="backBtn">← กลับ</button>' +
+      '<h2>' + App.esc(c.Case_ID) + '</h2>' +
+      '<span class="badge ' + App.statusBadgeClass(c.Status) + '">' +
+        App.esc(App.statusLabel(c.Status)) + '</span>' +
+      (quotes ? '<span class="badge ' + (quotes.valid >= quotes.required ? 'ok' : 'warn') + '">' +
+        'ใบเสนอราคาที่ใช้ได้ ' + quotes.valid + ' / ' + quotes.required + '</span>' : '') +
+      (ctx.canEdit ? '' : '<span class="badge">อ่านอย่างเดียว</span>') +
+      '<span class="spacer"></span>' +
+      '<span class="faint">เจ้าของงาน: ' + App.esc(c.Buyer_Owner) + '</span>' +
+      (ctx.bundle.driveFolderUrl
+        ? ' <a class="btn" href="' + App.esc(ctx.bundle.driveFolderUrl) + '" target="_blank" rel="noopener">โฟลเดอร์ไฟล์</a>'
+        : '') +
+      '<span id="headerActions"></span>' +
+      '</div>';
+  }
+
+  /**
+   * Blocking problems in red, non-blocking observations in yellow (SPEC §8.2).
+   * Filled by the rules engine; before it is loaded the banner is simply empty.
+   */
+  function ruleBanner(ctx) {
+    if (!ctx.rules) return '';
+    return App.alertHtml('error', 'ยังเปลี่ยนสถานะไม่ได้', ctx.rules.blockers || []) +
+      App.alertHtml('warn', 'ข้อควรตรวจสอบ', ctx.rules.warnings || []);
+  }
+
+  /** Header buttons (status change, exception, reassign, reopen) are contributed
+   *  by the phases that own those operations. */
+  var headerActions = [];
+  function registerHeaderAction(action) { headerActions.push(action); }
+
+  function bindHeaderActions(host, ctx) {
+    var slot = host.querySelector('#headerActions');
+    var usable = headerActions.filter(function (a) { return !a.visible || a.visible(ctx); });
+    slot.innerHTML = usable.map(function (a, i) {
+      return ' <button type="button" class="' + App.esc(a.className || '') + '" data-action="' + i + '">' +
+        App.esc(typeof a.label === 'function' ? a.label(ctx) : a.label) + '</button>';
+    }).join('');
+    slot.querySelectorAll('[data-action]').forEach(function (b) {
+      b.onclick = function () { usable[Number(b.dataset.action)].run(ctx); };
+    });
+  }
+
+  App.registerView({ id: 'case', label: 'รายละเอียดงาน', hidden: true, render: render });
+  App.registerCaseHeaderAction = registerHeaderAction;
+})();
+
+/* ------------------------------------------------------ tab: ข้อมูลงาน (SPEC §8.2) */
+(function () {
+  App.registerCaseTab({
+    id: 'info',
+    label: 'ข้อมูลงาน',
+    order: 10,
+    render: function (host, ctx) {
+      var c = ctx.caseRecord;
+      host.innerHTML =
+        '<div class="btn-row" style="margin-bottom:14px">' +
+          (ctx.canEdit ? '<button type="button" class="primary" id="editCaseBtn">แก้ไขข้อมูลงาน</button>' : '') +
+        '</div>' +
+        '<dl class="kv">' +
+          row('วันที่รับเรื่อง', App.fmtDate(c.Request_Date)) +
+          row('เอกสารอ้างอิง', c.Request_Ref) +
+          row('ผู้ขอ', c.Requester_Name + (c.Requester_Email ? ' (' + c.Requester_Email + ')' : '')) +
+          row('หน่วยงาน', App.labelOf('DEPARTMENT', c.Department_Code)) +
+          row('วิธีจัดซื้อ', App.labelOf('METHOD', c.Method)) +
+          row('ประเภทงบ', App.labelOf('BUDGET_TYPE', c.Budget_Type) + ' / ' + App.labelOf('SUB_TYPE', c.Sub_Type)) +
+          row('รายละเอียดงาน', c.Description) +
+          row('วันที่ต้องการ', App.fmtDate(c.Required_Date)) +
+          row('ข้อมูลจากผู้ขอ', c.Intake_Complete ? 'ครบถ้วน' : 'ยังไม่ครบ') +
+          (c.Intake_Note ? row('สิ่งที่ยังขาด', c.Intake_Note) : '') +
+          row('เจ้าของงาน', c.Buyer_Owner) +
+          row('เปิดงานเมื่อ', App.fmtDateTime(c.Created_At) + ' โดย ' + c.Created_By) +
+          row('แก้ไขล่าสุด', App.fmtDateTime(c.Updated_At) + ' โดย ' + c.Updated_By +
+            ' (เวอร์ชัน ' + c.Version + ')') +
+          (c.Exception_Reason_Code ? row('คำขอยกเว้น',
+            App.labelOf('EXCEPTION_REASON', c.Exception_Reason_Code) + ' — ' +
+            App.labelOf('EXCEPTION_STATUS', c.Exception_Status)) : '') +
+          (c.Closed_At ? row('ปิดงานเมื่อ', App.fmtDateTime(c.Closed_At)) : '') +
+        '</dl>';
+
+      var edit = host.querySelector('#editCaseBtn');
+      if (edit) edit.onclick = function () { openEdit(ctx); };
+    }
+  });
+
+  function row(label, value) {
+    return '<dt>' + App.esc(label) + '</dt><dd>' + App.esc(value === null || value === undefined ? '' : value) + '</dd>';
+  }
+
+  function openEdit(ctx) {
+    var c = ctx.caseRecord;
+    App.modal({
+      title: 'แก้ไขข้อมูลงาน ' + c.Case_ID,
+      submitLabel: 'บันทึก',
+      wide: true,
+      body: App.caseForm.html(c) +
+        '<div class="field"><label>เหตุผล (ไม่บังคับ สำหรับการแก้ไขทั่วไป)</label>' +
+        '<input type="text" name="reason" maxlength="500"></div>',
+      onOpen: function (form) { App.caseForm.wire(form); },
+      onSubmit: function (form, close) {
+        App.api('api_updateCase', c.Case_ID, App.caseForm.read(form), c.Version, form.reason.value.trim())
+          .then(function (result) {
+            close();
+            App.toast('บันทึกแล้ว', 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+      }
+    });
+  }
+})();
+
+/* --------------------------------------------------- tab: รายการ Item (SPEC §8.2) */
+(function () {
+  App.registerCaseTab({
+    id: 'items',
+    label: 'รายการ Item',
+    order: 20,
+    render: function (host, ctx) {
+      host.innerHTML =
+        '<div class="btn-row" style="margin-bottom:14px">' +
+          (ctx.canEdit ? '<button type="button" class="primary" id="addItemBtn">+ เพิ่มรายการ</button>' : '') +
+          '<span class="faint">ยอดรวมคำนวณจาก จำนวน × ราคาต่อหน่วย ตอนแสดงผลเท่านั้น ไม่ได้เก็บไว้ในฐานข้อมูล</span>' +
+        '</div>' +
+        (ctx.items.length ? table(ctx) : '<div class="empty">ยังไม่มีรายการในงานนี้</div>');
+
+      var add = host.querySelector('#addItemBtn');
+      if (add) add.onclick = function () { openItem(ctx, null); };
+      host.querySelectorAll('[data-edit]').forEach(function (b) {
+        b.onclick = function () { openItem(ctx, findItem(ctx, b.dataset.edit)); };
+      });
+      host.querySelectorAll('[data-del]').forEach(function (b) {
+        b.onclick = function () { removeItem(ctx, findItem(ctx, b.dataset.del)); };
+      });
+    }
+  });
+
+  function findItem(ctx, id) {
+    return ctx.items.filter(function (i) { return i.Item_Row_ID === id; })[0];
+  }
+
+  function table(ctx) {
+    var rows = ctx.items.map(function (item) {
+      return '<tr>' +
+        '<td class="num">' + App.esc(item.Line_No) + '</td>' +
+        '<td>' + App.esc(item.Item_Description) +
+          (item.Item_Code ? '<div class="faint">รหัส ' + App.esc(item.Item_Code) + '</div>' : '') + '</td>' +
+        '<td class="num">' + App.esc(item.Quantity) + '</td>' +
+        '<td>' + App.esc(App.labelOf('UNIT', item.Unit)) + '</td>' +
+        '<td>' + App.esc(item.Media_Site || '') +
+          (item.Media_Type ? '<div class="faint">' + App.esc(App.labelOf('MEDIA_TYPE', item.Media_Type)) + '</div>' : '') + '</td>' +
+        '<td>' + App.esc(item.Asset_No || '') + '</td>' +
+        '<td>' + App.esc(item.Remark || '') + '</td>' +
+        '<td class="nowrap">' + (ctx.canEdit
+          ? '<button type="button" class="subtle small" data-edit="' + App.esc(item.Item_Row_ID) + '">แก้ไข</button>' +
+            '<button type="button" class="subtle small" data-del="' + App.esc(item.Item_Row_ID) + '">ลบ</button>'
+          : '') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    return '<div class="table-wrap"><table><thead><tr>' +
+      '<th class="num">#</th><th>รายละเอียด</th><th class="num">จำนวน</th><th>หน่วย</th>' +
+      '<th>ป้าย/จุดติดตั้ง</th><th>Asset No.</th><th>หมายเหตุ</th><th></th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function openItem(ctx, item) {
+    var it = item || {};
+    App.modal({
+      title: item ? 'แก้ไขรายการที่ ' + it.Line_No : 'เพิ่มรายการ',
+      submitLabel: 'บันทึก',
+      body: '<div class="grid two">' +
+        App.caseForm.field('Item_Description', 'รายละเอียดรายการ',
+          '<input type="text" name="Item_Description" required maxlength="1000" value="' +
+          App.esc(it.Item_Description || '') + '">', true) +
+        App.caseForm.field('Item_Code', 'รหัสสินค้า (ถ้ามี)',
+          '<input type="text" name="Item_Code" maxlength="100" value="' + App.esc(it.Item_Code || '') + '">') +
+        App.caseForm.field('Quantity', 'จำนวน',
+          '<input type="number" name="Quantity" required step="any" min="0.0001" value="' +
+          App.esc(it.Quantity === undefined ? '' : it.Quantity) + '">', true) +
+        App.caseForm.field('Unit', 'หน่วย',
+          '<select name="Unit" required>' + App.optionsFor('UNIT', it.Unit) + '</select>', true) +
+        App.caseForm.field('Media_Site', 'ป้าย / จุดติดตั้ง',
+          '<input type="text" name="Media_Site" maxlength="200" value="' + App.esc(it.Media_Site || '') + '">') +
+        App.caseForm.field('Media_Type', 'ประเภทสื่อ',
+          '<select name="Media_Type">' + App.optionsFor('MEDIA_TYPE', it.Media_Type) + '</select>') +
+        App.caseForm.field('Asset_No', 'Asset No. (งานจุดใหม่ยังไม่มีได้)',
+          '<input type="text" name="Asset_No" maxlength="100" value="' + App.esc(it.Asset_No || '') + '">') +
+        '<div class="field span-all"><label>หมายเหตุ</label>' +
+          '<textarea name="Remark" maxlength="1000">' + App.esc(it.Remark || '') + '</textarea></div>' +
+        '</div>',
+      onSubmit: function (form, close) {
+        var payload = {
+          Item_Description: form.Item_Description.value.trim(),
+          Item_Code: form.Item_Code.value.trim(),
+          Quantity: form.Quantity.value,
+          Unit: form.Unit.value,
+          Media_Site: form.Media_Site.value.trim(),
+          Media_Type: form.Media_Type.value,
+          Asset_No: form.Asset_No.value.trim(),
+          Remark: form.Remark.value.trim()
+        };
+        if (item) payload.Item_Row_ID = item.Item_Row_ID;
+        App.api('api_saveItem', ctx.caseId, payload, item ? item.Version : null)
+          .then(function (result) {
+            close();
+            App.toast('บันทึกรายการแล้ว', 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+      }
+    });
+  }
+
+  function removeItem(ctx, item) {
+    App.askReason('ลบรายการที่ ' + item.Line_No,
+      'ราคาที่ผู้ขายเสนอสำหรับรายการนี้จะถูกลบไปด้วย และทั้งหมดจะถูกบันทึกไว้ในประวัติการแก้ไข')
+      .then(function (reason) {
+        App.api('api_deleteRecord', 'Case_Items', item.Item_Row_ID, item.Version, reason)
+          .then(function (result) {
+            App.toast('ลบรายการแล้ว', 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+      });
+  }
+})();
 </script>

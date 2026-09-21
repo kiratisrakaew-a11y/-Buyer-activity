@@ -659,3 +659,294 @@ test('escapeHtml neutralises markup in the denied page', function () {
     '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;', 'tags and quotes escaped');
   assertEquals(escapeHtml("O'Brien & Co"), 'O&#39;Brien &amp; Co', 'quote and ampersand escaped');
 });
+
+/* ============================================================================
+ * Phase 4 — Cases, Items, Drive folders
+ * ==========================================================================*/
+
+function newCasePayload(overrides) {
+  var payload = {
+    Request_Date: '2026-01-15',
+    Request_Ref: 'MEMO-2026-001',
+    Requester_Name: 'คุณสมชาย ใจดี',
+    Requester_Email: 'somchai@example.com',
+    Department_Code: 'OPS',
+    Method: 'NORMAL',
+    Budget_Type: 'CAPEX',
+    Sub_Type: 'NEW_LOCATION',
+    Description: 'ติดตั้งป้ายบิลบอร์ดจุดใหม่ ถนนพระราม 9',
+    Required_Date: '2026-03-01',
+    Intake_Complete: true,
+    Intake_Note: ''
+  };
+  Object.keys(overrides || {}).forEach(function (k) { payload[k] = overrides[k]; });
+  return payload;
+}
+
+/** Opens a Case as buyer A and returns its id. */
+function createCaseAs(email, overrides) {
+  return asUser(email, function () {
+    return assertApiOk(api_createCase(newCasePayload(overrides))).caseRecord.Case_ID;
+  });
+}
+
+function addItem(email, caseId, overrides) {
+  var item = Object.assign({
+    Item_Description: 'โครงสร้างเหล็กป้าย',
+    Quantity: 2,
+    Unit: 'SET',
+    Media_Site: 'RAMA9-001',
+    Media_Type: 'BILLBOARD'
+  }, overrides || {});
+  return asUser(email, function () {
+    return assertApiOk(api_saveItem(caseId, item)).item;
+  });
+}
+
+test('T1 opening a Case issues SRC-YYYY-0001, sets INTAKE, makes a folder and logs CREATE', function () {
+  withUsers(function () {
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_createCase(newCasePayload()));
+    });
+    var c = result.caseRecord;
+
+    assertEquals(c.Case_ID, 'SRC-' + IdGenerator.currentYear() + '-0001', 'first case id of the year');
+    assertEquals(c.Status, 'INTAKE', 'starts in INTAKE');
+    assertEquals(c.Buyer_Owner, USERS.buyerA, 'the creator owns it');
+    assertEquals(c.Version, 1, 'version starts at 1');
+    assert(!!c.Drive_Folder_ID, 'a Drive folder was created');
+    assertDeepEquals(result.warnings, [], 'no warnings for the first case');
+
+    var folder = DriveApp.getFolderById(c.Drive_Folder_ID);
+    assertEquals(folder.getName(), c.Case_ID + ' - ติดตั้งป้ายบิลบอร์ดจุดใหม่ ถนนพระราม 9', 'folder name');
+    assertEquals(folder.sharing.access, 'DOMAIN', 'folder shared inside the domain only');
+
+    var creates = logsFor('Cases', c.Case_ID).filter(function (l) { return l.Action === 'CREATE'; });
+    assertEquals(creates.length, 1, 'one CREATE entry');
+    assertEquals(creates[0].User, USERS.buyerA, 'logged against the buyer');
+    assertEquals(creates[0].Case_ID, c.Case_ID, 'log row carries the Case_ID');
+  });
+});
+
+test('creating a Case rejects codes that are not in Config_Lists', function () {
+  withUsers(function () {
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_createCase(newCasePayload({ Department_Code: 'NOT_A_DEPT' })), 'VALIDATION', 'bad department');
+      // SUB_TYPE is filtered by Budget_Type, so an OPEX sub-type under CAPEX is invalid.
+      assertApiError(api_createCase(newCasePayload({ Budget_Type: 'CAPEX', Sub_Type: 'GENERAL' })),
+        'VALIDATION', 'sub-type must belong to the budget type');
+      assertApiError(api_createCase(newCasePayload({ Description: '' })), 'VALIDATION', 'description required');
+      assertApiError(api_createCase(newCasePayload({ Requester_Email: 'not-an-email' })), 'VALIDATION', 'bad email');
+    });
+  });
+});
+
+test('an auditor cannot open a Case', function () {
+  withUsers(function () {
+    asUser(USERS.auditor, function () {
+      assertApiError(api_createCase(newCasePayload()), 'FORBIDDEN', 'auditors only read');
+    });
+  });
+});
+
+test('a second Case with the same Request_Ref warns but is still created', function () {
+  withUsers(function () {
+    var first = createCaseAs(USERS.buyerA);
+    var second = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_createCase(newCasePayload()));
+    });
+    assertEquals(second.warnings.length, 1, 'one warning');
+    assertContains(second.warnings[0], first, 'names the earlier Case');
+    assert(!!second.caseRecord.Case_ID, 'the Case was still created');
+  });
+});
+
+test('T10 a buyer cannot edit another buyer\'s Case', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+
+    asUser(USERS.buyerB, function () {
+      var error = assertApiError(api_updateCase(caseId, { Description: 'แก้โดยคนอื่น' }, 1), 'FORBIDDEN',
+        'buyer B may not edit');
+      assertEquals(error.details.owner, USERS.buyerA, 'the error names the owner');
+
+      // Reading it is fine while BUYER_CAN_VIEW_ALL is on.
+      var bundle = assertApiOk(api_getCase(caseId));
+      assertEquals(bundle.permissions.canEdit, false, 'read-only for buyer B');
+    });
+
+    // HEAD may edit any Case.
+    asUser(USERS.head, function () {
+      assertApiOk(api_updateCase(caseId, { Description: 'แก้โดยหัวหน้า' }, 1));
+    });
+    assertEquals(Repository.requireById('Cases', caseId).Description, 'แก้โดยหัวหน้า', 'head edit applied');
+  });
+});
+
+test('BUYER_CAN_VIEW_ALL = FALSE hides other buyers\' Cases', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    Config.setSetting('BUYER_CAN_VIEW_ALL', 'FALSE');
+
+    asUser(USERS.buyerB, function () {
+      assertApiError(api_getCase(caseId), 'FORBIDDEN', 'hidden from other buyers');
+    });
+    asUser(USERS.auditor, function () {
+      assertApiOk(api_getCase(caseId), 'auditors always see everything');
+    });
+  });
+});
+
+test('api_updateCase refuses to change owner or status through the back door', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_updateCase(caseId, { Buyer_Owner: USERS.buyerB, Status: 'SOURCING_DONE' }, 1),
+        'VALIDATION', 'neither field is editable here');
+    });
+    var stored = Repository.requireById('Cases', caseId);
+    assertEquals(stored.Buyer_Owner, USERS.buyerA, 'owner unchanged');
+    assertEquals(stored.Status, 'INTAKE', 'status unchanged');
+  });
+});
+
+test('items get sequential line numbers and appear in the Case bundle', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var first = addItem(USERS.buyerA, caseId, { Item_Description: 'โครงสร้างเหล็ก' });
+    var second = addItem(USERS.buyerA, caseId, { Item_Description: 'งานติดตั้ง', Quantity: 1, Unit: 'JOB' });
+
+    assertEquals(first.Line_No, 1, 'first line');
+    assertEquals(second.Line_No, 2, 'second line');
+
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(caseId)); });
+    assertEquals(bundle.items.length, 2, 'both items returned');
+    assertEquals(bundle.items[0].Item_Description, 'โครงสร้างเหล็ก', 'ordered by line number');
+    assertEquals(bundle.caseRecord.Case_ID, caseId, 'the case itself');
+    assert(!!bundle.driveFolderUrl, 'folder link for the UI');
+  });
+});
+
+test('item quantity must be greater than zero', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_saveItem(caseId, { Item_Description: 'ของ', Quantity: 0, Unit: 'PCS' }),
+        'VALIDATION', 'zero quantity');
+      assertApiError(api_saveItem(caseId, { Item_Description: 'ของ', Quantity: -5, Unit: 'PCS' }),
+        'VALIDATION', 'negative quantity');
+      assertApiError(api_saveItem(caseId, { Item_Description: 'ของ', Quantity: 1, Unit: 'BOX' }),
+        'VALIDATION', 'unit not in the list');
+    });
+  });
+});
+
+test('editing an item stores a new version and honours optimistic locking', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var item = addItem(USERS.buyerA, caseId);
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveItem(caseId, { Item_Row_ID: item.Item_Row_ID, Quantity: 5 }, 1));
+      assertApiError(api_saveItem(caseId, { Item_Row_ID: item.Item_Row_ID, Quantity: 9 }, 1),
+        'CONFLICT', 'stale version rejected');
+    });
+    assertEquals(Repository.requireById('Case_Items', item.Item_Row_ID).Quantity, 5, 'first save won');
+  });
+});
+
+test('an item whose Media_Site is already on an open Case produces a warning', function () {
+  withUsers(function () {
+    var first = createCaseAs(USERS.buyerA);
+    addItem(USERS.buyerA, first, { Media_Site: 'RAMA9-001' });
+
+    var second = createCaseAs(USERS.buyerA, { Request_Ref: 'MEMO-2026-002' });
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_saveItem(second, {
+        Item_Description: 'งานซ่อมป้ายเดิม', Quantity: 1, Unit: 'JOB', Media_Site: 'RAMA9-001'
+      }));
+    });
+    assertEquals(result.warnings.length, 1, 'one warning');
+    assertContains(result.warnings[0], first, 'names the other Case');
+  });
+});
+
+test('T13 deleting an item soft-deletes its quote lines and logs every removal', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var item = addItem(USERS.buyerA, caseId);
+    var keep = addItem(USERS.buyerA, caseId, { Item_Description: 'รายการที่เก็บไว้' });
+
+    // Two vendors priced the item that is about to be deleted.
+    ['CV-000001', 'CV-000002'].forEach(function (cv) {
+      Repository.insert('Quote_Lines', {
+        Case_ID: caseId, Case_Vendor_ID: cv, Item_Row_ID: item.Item_Row_ID,
+        Vendor_Unit: 'SET', Vendor_Unit_Price: 1000
+      }, { actor: USERS.buyerA, caseId: caseId });
+    });
+    Repository.insert('Quote_Lines', {
+      Case_ID: caseId, Case_Vendor_ID: 'CV-000001', Item_Row_ID: keep.Item_Row_ID,
+      Vendor_Unit: 'SET', Vendor_Unit_Price: 500
+    }, { actor: USERS.buyerA, caseId: caseId });
+
+    var result = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_deleteRecord('Case_Items', item.Item_Row_ID, 1, 'ผู้ขอยกเลิกรายการนี้'));
+    });
+
+    assertEquals(result.deletedQuoteLines, 2, 'both quote lines cascaded');
+    assertEquals(Repository.findById('Case_Items', item.Item_Row_ID), null, 'item hidden');
+    assertEquals(Repository.queryByCase('Quote_Lines', caseId).length, 1, 'only the untouched line remains');
+
+    // Nothing was physically removed.
+    assert(!!Repository.findById('Case_Items', item.Item_Row_ID, { includeDeleted: true }), 'item row still there');
+
+    var deletes = Repository.readAll('Change_Log').filter(function (l) { return l.Action === 'DELETE'; });
+    assertEquals(deletes.length, 3, 'one DELETE entry per removed row');
+    deletes.forEach(function (d) { assertEquals(d.Case_ID, caseId, 'every delete is attributed to the Case'); });
+  });
+});
+
+test('deleting an item without a reason is rejected', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+    var item = addItem(USERS.buyerA, caseId);
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_deleteRecord('Case_Items', item.Item_Row_ID, 1, '  '), 'VALIDATION', 'reason required');
+      assertApiError(api_deleteRecord('Cases', caseId, 1, 'ไม่เอาแล้ว'), 'VALIDATION', 'Cases are cancelled, not deleted');
+    });
+    assert(!!Repository.findById('Case_Items', item.Item_Row_ID), 'item untouched');
+  });
+});
+
+test('My Cases lists only what the caller may see and flags overdue next actions', function () {
+  withUsers(function () {
+    var mine = createCaseAs(USERS.buyerA, { Description: 'งานของเอ' });
+    createCaseAs(USERS.buyerB, { Request_Ref: 'MEMO-B', Description: 'งานของบี' });
+
+    Repository.insert('Activities', {
+      Case_ID: mine, Module: 'M1', Activity_Date: new Date(), Activity_Type: 'EMAIL_RFQ',
+      Activity_Description: 'ส่ง RFQ ให้ผู้ขาย', Performed_By: USERS.buyerA,
+      Next_Action: 'ตามใบเสนอราคา', Next_Action_Date: '2020-01-01', Next_Action_Done: false
+    }, { actor: USERS.buyerA, caseId: mine });
+
+    var own = asUser(USERS.buyerA, function () { return assertApiOk(api_listCases({ scope: 'mine' })); });
+    assertEquals(own.cases.length, 1, 'only my own Cases by default');
+    assertEquals(own.cases[0].Case_ID, mine, 'the right one');
+    assertEquals(own.cases[0].nextAction.overdue, true, 'the overdue next action is flagged');
+    assertEquals(own.cases[0].nextAction.text, 'ตามใบเสนอราคา', 'next action text');
+
+    var all = asUser(USERS.buyerA, function () { return assertApiOk(api_listCases({ scope: 'all' })); });
+    assertEquals(all.cases.length, 2, 'both Cases when asking for all');
+
+    var filtered = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_listCases({ scope: 'all', q: 'งานของบี' }));
+    });
+    assertEquals(filtered.cases.length, 1, 'text search');
+    assertEquals(filtered.cases[0].canEdit, false, 'buyer A cannot edit buyer B\'s Case');
+
+    var byStatus = asUser(USERS.buyerA, function () {
+      return assertApiOk(api_listCases({ scope: 'all', status: 'SOURCING_DONE' }));
+    });
+    assertEquals(byStatus.cases.length, 0, 'status filter');
+  });
+});
