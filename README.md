@@ -66,6 +66,16 @@ repo นี้มี `.clasp.json` อยู่แล้ว `clasp create` จ�
 
 ## 3. การติดตั้งครั้งแรก
 
+> 📘 **ติดตั้งครั้งแรกให้เปิด [`docs/INSTALL.md`](docs/INSTALL.md) ตามทีละขั้น** — มีทั้งวิธีใช้ clasp
+> และวิธี copy-paste เองโดยไม่ต้องลง Node (พร้อม checklist ครบทั้ง 37 ไฟล์) และหัวข้อแก้ปัญหาที่พบบ่อย
+> หัวข้อนี้เป็นเวอร์ชันย่อสำหรับคนที่ใช้ clasp อยู่แล้ว
+
+**สร้างเป็น standalone script เท่านั้น** — ไปที่ [script.google.com](https://script.google.com) → `New project`
+**อย่า**สร้างจากเมนู `Extensions` → `Apps Script` ในชีต (นั่นคือ container-bound: ลบชีตแล้วสคริปต์หายไปด้วย
+และเปลี่ยน DB ทีหลังไม่ได้)
+
+ชีตที่เก็บข้อมูลเป็นคนละไฟล์กับสคริปต์ และ **`setup()` สร้างให้เอง** — ไม่ต้องสร้างชีตไว้ก่อน
+
 ต้องมี [Node.js](https://nodejs.org/) และ [clasp](https://github.com/google/clasp) (`npm i -g @google/clasp`)
 
 ```bash
@@ -366,6 +376,7 @@ tests/
   Tests.js          ชุดทดสอบชุดเดียว
   node/             mock ของ Apps Script + ตัวรันบน Node
 docs/
+  INSTALL.md        คู่มือติดตั้งลง Apps Script ทีละขั้น (clasp / copy-paste เอง)
   UAT.md            checklist ทดลองใช้ก่อนเปิดให้ทั้งฝ่าย
 ```
 
