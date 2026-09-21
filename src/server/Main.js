@@ -20,7 +20,7 @@ function doGet() {
     return renderDenied(error);
   }
 
-  var template = HtmlService.createTemplateFromFile('client/Index');
+  var template = HtmlService.createTemplateFromFile(resolveHtmlName('client/Index'));
   template.userName = user.name;
   template.userEmail = user.email;
   template.userRole = user.role;
@@ -51,7 +51,68 @@ function renderDenied(message) {
 
 /** Used by the templates to compose the single page from several HTML files. */
 function include(filename) {
-  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+  return HtmlService.createHtmlOutputFromFile(resolveHtmlName(filename)).getContent();
+}
+
+/**
+ * Apps Script has no folders. clasp turns a path into a file NAME that happens to
+ * contain slashes, so `src/client/views/MyCases.html` becomes the file
+ * `client/views/MyCases` — but only while `.clasp.json` keeps `"rootDir": "src"`.
+ * Lose that, push from a different root, or add the files by hand, and the same
+ * file answers to a different name.
+ *
+ * Every page of this app is assembled from eleven such files, so one wrong name
+ * is not a missing panel, it is a blank application with an unexplained error.
+ * Rather than depend on a naming convention this code cannot verify, ask for the
+ * most specific name and fall back to progressively shorter ones:
+ *
+ *   client/views/MyCases  ->  views/MyCases  ->  MyCases
+ *
+ * Results are memoised, so the probing costs one extra read per file per request
+ * at worst, and nothing once the name is known.
+ */
+var htmlNameCache = {};
+
+/**
+ * Names to try, most specific first.
+ *
+ * Shortening covers a push made from deeper in the tree. The "src/" candidate
+ * covers the opposite mistake, which is the likelier one: `.clasp.json` losing
+ * `"rootDir": "src"`, after which every file answers to `src/client/...`.
+ * verifyDeployment() reports the name that actually matched, so an administrator
+ * still sees that the configuration drifted even though the app kept working.
+ */
+function candidateHtmlNames(logicalName) {
+  var parts = String(logicalName).split('/');
+  var candidates = [logicalName, 'src/' + logicalName];
+  for (var i = 1; i < parts.length; i++) {
+    candidates.push(parts.slice(i).join('/'));
+  }
+  return candidates;
+}
+
+function resolveHtmlName(logicalName) {
+  if (Object.prototype.hasOwnProperty.call(htmlNameCache, logicalName)) {
+    return htmlNameCache[logicalName];
+  }
+  var tried = candidateHtmlNames(logicalName);
+  for (var i = 0; i < tried.length; i++) {
+    try {
+      HtmlService.createHtmlOutputFromFile(tried[i]);
+      htmlNameCache[logicalName] = tried[i];
+      return tried[i];
+    } catch (e) {
+      // Not under this name; try a shorter one.
+    }
+  }
+  throw Err.internal('ไม่พบไฟล์หน้าเว็บ "' + logicalName + '" ในโปรเจกต์ Apps Script ' +
+    '(ลองชื่อ: ' + tried.join(', ') + ') — กรุณาตรวจว่า clasp push สำเร็จ ' +
+    'และ .clasp.json ยังตั้ง "rootDir": "src" ไว้');
+}
+
+/** Tests clear the memo between scenarios; a real request starts with it empty anyway. */
+function __resetHtmlNameCache() {
+  htmlNameCache = {};
 }
 
 /** Server-side escaping for the few strings Main.js injects directly. */

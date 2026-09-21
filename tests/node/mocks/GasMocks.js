@@ -478,9 +478,54 @@ function createGasEnvironment() {
     }
   };
 
+  // HTML files as Apps Script sees them: a flat map of name -> content, where the
+  // name carries slashes. Unknown names throw, exactly as the real service does,
+  // which is what lets the tests exercise the name resolver.
+  const htmlFiles = {};
+  let globalScope = null;
+
+  function htmlEscape(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function readHtmlFile(name) {
+    if (!Object.prototype.hasOwnProperty.call(htmlFiles, name)) {
+      throw new Error(`No HTML file named ${name}`);
+    }
+    return htmlFiles[name];
+  }
+
+  /**
+   * Evaluates the scriptlet subset this project actually uses:
+   *   <?!= include('name'); ?>   printed unescaped, via the app's own include()
+   *   <?= property ?>            printed escaped, from the template's properties
+   * Anything else is left alone; this is a stand-in, not a template engine.
+   */
+  function evaluateTemplate(content, properties) {
+    return String(content)
+      .replace(/<\?!=\s*include\(\s*['"]([^'"]+)['"]\s*\)\s*;?\s*\?>/g, (match, name) => {
+        if (!globalScope || typeof globalScope.include !== 'function') {
+          throw new Error('include() is not defined in the loaded script');
+        }
+        return globalScope.include(name);
+      })
+      .replace(/<\?=\s*([A-Za-z_$][\w$]*)\s*\?>/g, (match, property) =>
+        htmlEscape(properties[property]));
+  }
+
   const HtmlService = {
-    createTemplateFromFile: () => ({ evaluate: () => HtmlService.createHtmlOutput('') }),
-    createHtmlOutputFromFile: () => HtmlService.createHtmlOutput(''),
+    createTemplateFromFile(name) {
+      const content = readHtmlFile(name);
+      const template = {
+        evaluate() { return HtmlService.createHtmlOutput(evaluateTemplate(content, template)); }
+      };
+      return template;
+    },
+    createHtmlOutputFromFile(name) {
+      return HtmlService.createHtmlOutput(readHtmlFile(name));
+    },
     createHtmlOutput: (content) => ({
       _content: content || '',
       getContent() { return this._content; },
@@ -506,6 +551,14 @@ function createGasEnvironment() {
     // Test-side handles the suite uses to inspect or steer the environment.
     __test: {
       setActiveUser(email) { activeUserEmail = email; effectiveUserEmail = email; },
+      /** The runner hands the mock the loaded script's globals so include() can be called back. */
+      setGlobalScope(scope) { globalScope = scope; },
+      /** Replaces the HTML file table, to simulate a different clasp naming scheme. */
+      setHtmlFiles(files) {
+        Object.keys(htmlFiles).forEach((k) => delete htmlFiles[k]);
+        Object.keys(files).forEach((k) => { htmlFiles[k] = files[k]; });
+      },
+      htmlFileNames() { return Object.keys(htmlFiles); },
       getActiveUser() { return activeUserEmail; },
       sentMail,
       clearMail() { sentMail.length = 0; },

@@ -81,6 +81,14 @@ function withFreshDatabase(fn) {
   Config.__clearDbOverride();
   Config.clearCache();
 
+  // Triggers and sent mail live outside the spreadsheet, so a fresh database is
+  // not by itself a fresh world. Clearing triggers is safe only under the mock:
+  // on Apps Script the project's real reminder trigger belongs to production.
+  if (typeof __test !== 'undefined') {
+    __test.clearMail();
+    ScriptApp.getProjectTriggers().forEach(function (t) { ScriptApp.deleteTrigger(t); });
+  }
+
   var report = setup();
   try {
     return fn(report);
@@ -1856,10 +1864,9 @@ test('a module can register its own transition rule without touching Rules.js', 
       assertEquals(calls.length, 1, 'called once');
       assertEquals(currentCase(caseId).Status, 'INTAKE', 'the Case did not move');
     } finally {
-      // Put the registry back the way Rules.js left it.
+      // Emptying the registry is enough: the M1 defaults reinstall themselves
+      // on the next use, through Bootstrap.
       StatusEngine.__resetRegistry();
-      StatusEngine.registerRule('SOURCING', 'SOURCING_DONE', Rules.minQuotes);
-      StatusEngine.registerRecheck(Rules.recheckMinQuotes);
     }
   });
 });
@@ -2147,5 +2154,275 @@ test('the list badge falls back to an approximate count on a very large database
     } finally {
       Repository.rowCount = realRowCount;
     }
+  });
+});
+
+/* ============================================================================
+ * HTML file name resolution
+ *
+ * Apps Script has no folders: clasp turns src/client/views/MyCases.html into a
+ * file NAMED "client/views/MyCases". That name depends on .clasp.json keeping
+ * "rootDir": "src", which this codebase cannot verify from outside Google. Every
+ * page is assembled from eleven such files, so one wrong name means a blank app.
+ *
+ * These run under the Node mock only; on Apps Script, verifyDeployment() check 3
+ * proves the same thing against the real project.
+ * ==========================================================================*/
+
+if (typeof __test !== 'undefined') {
+
+  /** Runs fn with the HTML files renamed by `rename`, then puts everything back. */
+  function withHtmlNames(rename, fn) {
+    var original = __test.defaultHtmlFiles;
+    var renamed = {};
+    Object.keys(original).forEach(function (name) { renamed[rename(name)] = original[name]; });
+    __test.setHtmlFiles(renamed);
+    __resetHtmlNameCache();
+    try {
+      return fn();
+    } finally {
+      __test.setHtmlFiles(original);
+      __resetHtmlNameCache();
+    }
+  }
+
+  test('doGet assembles the whole page from the real client files', function () {
+    withUsers(function () {
+      asUser(USERS.buyerA, function () {
+        var html = doGet().getContent();
+
+        assert(html.length > 50000, 'the page is assembled, not a stub — got ' + html.length + ' bytes');
+        assertContains(html, 'var App =', 'App.js was included');
+        assertContains(html, 'งานของฉัน', 'the My Cases view was included');
+        assertContains(html, 'ตารางเปรียบเทียบราคา', 'the vendor and price tab was included');
+        assertContains(html, 'ประวัติการแก้ไข', 'the change-history tab was included');
+        assertEquals(/<\?[!=]/.test(html), false, 'no scriptlet was left unevaluated');
+
+        // The signed-in user is rendered into the header, escaped.
+        assertContains(html, USERS.buyerA, 'the header shows who is signed in');
+      });
+    });
+  });
+
+  test('resolveHtmlName falls back when clasp names the files differently', function () {
+    withUsers(function () {
+      // rootDir lost from .clasp.json: every file answers to "src/client/..." instead.
+      withHtmlNames(function (name) { return 'src/' + name; }, function () {
+        assertEquals(resolveHtmlName('client/Index'), 'src/client/Index', 'found under the longer name');
+        asUser(USERS.buyerA, function () {
+          assert(doGet().getContent().length > 50000, 'the app works rather than going blank');
+        });
+      });
+
+      // Pushed from inside src/client: the "client/" segment is gone.
+      withHtmlNames(function (name) { return name.replace(/^client\//, ''); }, function () {
+        assertEquals(resolveHtmlName('client/Index'), 'Index', 'resolved by dropping a segment');
+        assertEquals(resolveHtmlName('client/views/MyCases'), 'views/MyCases', 'and for a nested file');
+        asUser(USERS.buyerA, function () {
+          assert(doGet().getContent().length > 50000, 'the page still renders');
+        });
+      });
+
+      // Added by hand in the editor: flat names, no slashes at all.
+      withHtmlNames(function (name) { return name.split('/').pop(); }, function () {
+        assertEquals(resolveHtmlName('client/views/MyCases'), 'MyCases', 'resolved to the bare name');
+        asUser(USERS.buyerA, function () {
+          assert(doGet().getContent().length > 50000, 'the page still renders');
+        });
+      });
+    });
+  });
+
+  test('a genuinely missing page file gives an error that says what to check', function () {
+    withUsers(function () {
+      withHtmlNames(function (name) { return 'nowhere/' + name.split('/').pop(); }, function () {
+        var error = assertThrowsCode('INTERNAL', function () {
+          resolveHtmlName('client/views/MyCases');
+        }, 'nothing matches');
+        assertContains(error.message, 'client/views/MyCases', 'it names the file it wanted');
+        assertContains(error.message, 'views/MyCases', 'and lists the names it tried');
+        assertContains(error.message, 'rootDir', 'and points at the likely cause');
+      });
+    });
+  });
+
+  test('every file Index.html includes can be resolved', function () {
+    withUsers(function () {
+      var expected = [
+        'client/Styles', 'client/App.js',
+        'client/views/MyCases', 'client/views/CaseDetail', 'client/views/CaseVendors',
+        'client/views/CaseStatus', 'client/views/CaseActivity', 'client/views/CaseHistory',
+        'client/views/Vendors', 'client/views/TeamView'
+      ];
+      expected.forEach(function (name) {
+        assertEquals(resolveHtmlName(name), name, name + ' resolves');
+        assert(include(name).length > 0, name + ' has content');
+      });
+    });
+  });
+}
+
+/* ============================================================================
+ * Load order — Apps Script picks its own, so nothing may depend on it
+ * ==========================================================================*/
+
+test('the rule registry fills itself on first use, not at load time', function () {
+  withUsers(function () {
+    // This is the state a fresh Apps Script execution starts in.
+    StatusEngine.__resetRegistry();
+
+    var c = sourcingCase(USERS.buyerA, 2);
+    assertApiError(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'RULE_VIOLATION',
+      'the minimum-quotations rule is in force without anyone having registered it');
+
+    StatusEngine.__resetRegistry();
+    var bundle = asUser(USERS.buyerA, function () { return assertApiOk(api_getCase(c.caseId)); });
+    assertEquals(bundle.rules.quotes.required, 3, 'and the recheck side is installed too');
+    assert(bundle.nextStatuses.length > 0, 'allowedNextFor installs the registry as well');
+  });
+});
+
+/* ============================================================================
+ * verifyDeployment — the post-deployment self-check
+ * ==========================================================================*/
+
+function checkById(report, id) {
+  var found = report.checks.filter(function (c) { return c.id === id; })[0];
+  assert(!!found, 'no check with id ' + id);
+  return found;
+}
+
+/** Brings a freshly set up database up to "ready for production". */
+function makeProductionReady() {
+  seedUsers();
+  installTriggers();
+
+  var folder = DriveApp.createFolder('ไฟล์แนบงานจัดซื้อ');
+  Config.setSetting('DRIVE_ROOT_FOLDER_ID', folder.getId());
+
+  // Replace the sample dropdown values with the company's own.
+  var sheet = Config.getSheet('Config_Lists');
+  sheet.appendRow(['DEPARTMENT', 'OOH', 'ฝ่ายสื่อนอกบ้าน', '', 40, true]);
+  sheet.appendRow(['UNIT', 'LM', 'เมตร', '', 50, true]);
+  sheet.appendRow(['MEDIA_TYPE', 'TRIVISION', 'ป้ายสามหน้า', '', 40, true]);
+  Config.clearCache();
+}
+
+test('verifyDeployment passes every check on a correctly configured system', function () {
+  withFreshDatabase(function () {
+    makeProductionReady();
+
+    var report = verifyDeployment();
+    var failing = report.checks.filter(function (c) { return c.status !== 'PASS'; });
+    assertEquals(failing.map(function (c) { return c.id + '=' + c.status + ' (' + c.detail + ')'; }).join('; '),
+      '', 'no check should be anything but PASS');
+
+    assertEquals(report.ok, true, 'ok');
+    assertEquals(report.readyForProduction, true, 'ready for production');
+    assert(!!report.info.webAppUrl, 'reports the web app URL for the administrator');
+    assert(!!report.info.databaseUrl, 'and the database URL');
+    // The five seeded people plus the ADMIN that setup() adds for whoever ran it.
+    assertEquals(report.info.activeUsers, 6, 'and how many people can sign in');
+  });
+});
+
+test('verifyDeployment warns about the sample dropdown values setup() seeds', function () {
+  withFreshDatabase(function () {
+    seedUsers();
+    var report = Verify.run();
+
+    var sample = checkById(report, 'sampleData');
+    assertEquals(sample.status, 'WARN', 'still the examples');
+    assertContains(sample.detail, 'DEPARTMENT', 'names the list');
+    assertContains(sample.detail, 'OPS', 'and shows the values that are still in place');
+
+    assertEquals(report.ok, true, 'a warning does not make the system unusable');
+    assertEquals(report.readyForProduction, false, 'but it is not ready for the whole department');
+  });
+});
+
+test('verifyDeployment fails loudly when nobody can sign in or approve', function () {
+  withFreshDatabase(function () {
+    // Nothing but the ADMIN that setup() seeded for whoever ran it.
+    var users = checkById(Verify.run(), 'users');
+    assertEquals(users.status, 'FAIL', 'no HEAD means exceptions can never be approved');
+    assertContains(users.detail, 'HEAD', 'and it says which role is missing');
+
+    Config.getSheet('Users').appendRow(['head@example.com', 'หัวหน้า', 'HEAD', '', true]);
+    Repository.resetCache();
+    var withHead = checkById(Verify.run(), 'users');
+    assertEquals(withHead.status, 'WARN', 'now only the buyers are missing');
+    assertContains(withHead.detail, 'BUYER', 'and it says so');
+  });
+});
+
+test('installTriggers leaves exactly one daily trigger, however often it is run', function () {
+  withFreshDatabase(function () {
+    seedUsers();
+    installTriggers();
+    installTriggers();
+    installTriggers();
+    var check = checkById(Verify.run(), 'trigger');
+    assertEquals(check.status, 'PASS', 'no duplicates were left behind');
+    assertContains(check.detail, '1 ตัว', 'exactly one');
+  });
+});
+
+if (typeof __test !== 'undefined') {
+
+  test('verifyDeployment warns when the daily trigger was never installed', function () {
+    withFreshDatabase(function () {
+      seedUsers();
+      var check = checkById(Verify.run(), 'trigger');
+      assertEquals(check.status, 'WARN', 'not installed yet');
+      assertContains(check.detail, 'installTriggers', 'and says what to run');
+      assertContains(check.detail, 'หมดอายุ', 'and why it matters beyond the e-mail');
+    });
+  });
+
+  test('verifyDeployment catches HTML files that clasp named unexpectedly', function () {
+    withFreshDatabase(function () {
+      makeProductionReady();
+      assertEquals(checkById(Verify.run(), 'htmlFiles').status, 'PASS', 'baseline is clean');
+
+      // rootDir lost: the app still runs, but the configuration has drifted.
+      withHtmlNames(function (name) { return 'src/' + name; }, function () {
+        var drifted = checkById(Verify.run(), 'htmlFiles');
+        assertEquals(drifted.status, 'WARN', 'works, but flagged');
+        assertContains(drifted.detail, 'rootDir', 'and points at the cause');
+      });
+
+      // Push incomplete: files genuinely absent.
+      withHtmlNames(function (name) { return 'unrelated/' + name.split('/').pop(); }, function () {
+        var broken = checkById(Verify.run(), 'htmlFiles');
+        assertEquals(broken.status, 'FAIL', 'the app cannot render at all');
+        assertContains(broken.detail, 'clasp push', 'and says what to check');
+      });
+    });
+  });
+}
+
+test('verifyDeployment reports a broken Drive folder id rather than throwing', function () {
+  withFreshDatabase(function () {
+    seedUsers();
+    assertEquals(checkById(Verify.run(), 'driveFolder').status, 'WARN', 'blank means auto-create');
+
+    Config.setSetting('DRIVE_ROOT_FOLDER_ID', 'folder_that_does_not_exist');
+    var broken = checkById(Verify.run(), 'driveFolder');
+    assertEquals(broken.status, 'FAIL', 'set but unreachable is a real problem');
+
+    // One bad check must not stop the others from running.
+    assertEquals(Verify.run().checks.length, 12, 'every check still ran');
+  });
+});
+
+test('api_verifyDeployment is restricted to ADMIN', function () {
+  withUsers(function () {
+    asUser(USERS.head, function () {
+      assertApiError(api_verifyDeployment(), 'FORBIDDEN', 'not for the head of procurement');
+    });
+    asUser(USERS.admin, function () {
+      assert(assertApiOk(api_verifyDeployment()).checks.length > 0, 'admins may run it from the app');
+    });
   });
 });

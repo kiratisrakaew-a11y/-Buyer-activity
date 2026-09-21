@@ -299,6 +299,13 @@ function api_teamView() {
   });
 }
 
+/** The post-deployment checklist, also reachable from the app for an administrator. */
+function api_verifyDeployment() {
+  return handle('api_verifyDeployment', API_ROLES.ADMIN_ONLY, function () {
+    return Verify.run();
+  });
+}
+
 /** Lets an administrator run the daily job by hand, e.g. after fixing a trigger. */
 function api_runDailyJob() {
   return handle('api_runDailyJob', API_ROLES.ADMIN_ONLY, function () {

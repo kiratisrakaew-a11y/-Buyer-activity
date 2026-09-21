@@ -21,42 +21,42 @@ const { createGasEnvironment } = require('./mocks/GasMocks');
 const ROOT = path.resolve(__dirname, '..', '..');
 const SERVER_DIR = path.join(ROOT, 'src', 'server');
 
-/** Explicit order keeps stack traces readable; the code itself is order-independent. */
-const LOAD_ORDER = [
-  'Errors.js',
-  'Schema.js',
-  'Utils.js',
-  'Config.js',
-  'IdGenerator.js',
-  'ChangeLog.js',
-  'Repository.js',
-  'Validation.js',
-  'Auth.js',
-  'DriveService.js',
-  'StatusEngine.js',
-  'Rules.js',
-  'CaseService.js',
-  'CaseWorkflow.js',
-  'ItemService.js',
-  'VendorService.js',
-  'QuoteService.js',
-  'ActivityService.js',
-  'ReferenceService.js',
-  'TeamService.js',
-  'Notification.js',
-  'Setup.js',
-  'Api.js',
-  'Main.js'
-];
-
+/**
+ * Files load in plain alphabetical order, on purpose.
+ *
+ * Apps Script decides for itself in what order it evaluates the files of a
+ * project, and alphabetical is the worst case this codebase is likely to meet
+ * (it puts Rules.js before StatusEngine.js, and Api.js before everything it
+ * calls). Loading that way here means a module that reaches for another module
+ * at load time fails in this suite instead of failing in production, where it
+ * would take the entire script down rather than one feature.
+ */
 function serverFiles() {
-  const present = fs.readdirSync(SERVER_DIR).filter((f) => f.endsWith('.js'));
-  const ordered = LOAD_ORDER.filter((f) => present.includes(f));
-  const extras = present.filter((f) => !LOAD_ORDER.includes(f)).sort();
-  if (extras.length) {
-    console.warn(`note: ${extras.join(', ')} not listed in LOAD_ORDER, appended`);
-  }
-  return ordered.concat(extras).map((f) => path.join(SERVER_DIR, f));
+  return fs.readdirSync(SERVER_DIR)
+    .filter((f) => f.endsWith('.js'))
+    .sort()
+    .map((f) => path.join(SERVER_DIR, f));
+}
+
+/**
+ * The client HTML files, keyed by the name clasp gives them in the Apps Script
+ * project: the path below `src` with the trailing `.html` removed. So
+ * `src/client/Index.html` becomes `client/Index`, and `src/client/App.js.html`
+ * becomes `client/App.js` — only the final extension is stripped.
+ */
+function clientHtmlFiles() {
+  const root = path.join(ROOT, 'src');
+  const files = {};
+  (function walk(dir) {
+    fs.readdirSync(dir, { withFileTypes: true }).forEach((entry) => {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) return walk(full);
+      if (!entry.name.endsWith('.html')) return;
+      const name = path.relative(root, full).split(path.sep).join('/').replace(/\.html$/, '');
+      files[name] = fs.readFileSync(full, 'utf8');
+    });
+  })(path.join(root, 'client'));
+  return files;
 }
 
 function buildContext() {
@@ -74,6 +74,13 @@ function buildContext() {
       throw e;
     }
   });
+
+  // The mock calls back into the loaded script's include(), and serves the real
+  // client files under their real names, so a template test exercises the whole chain.
+  const htmlFiles = clientHtmlFiles();
+  sandbox.__test.setGlobalScope(sandbox);
+  sandbox.__test.setHtmlFiles(htmlFiles);
+  sandbox.__test.defaultHtmlFiles = htmlFiles;
 
   const testFile = path.join(ROOT, 'tests', 'Tests.js');
   vm.runInContext(fs.readFileSync(testFile, 'utf8'), context, { filename: 'tests/Tests.js' });

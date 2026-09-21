@@ -240,10 +240,22 @@ var Rules = (function () {
     return StatusEngine.runRechecks(caseRecord);
   }
 
-  StatusEngine.registerRule(SOURCING, SOURCING_DONE, minQuotes);
-  StatusEngine.registerRecheck(recheckMinQuotes);
+  /**
+   * Attaches this module's rules to StatusEngine.
+   *
+   * Called at run time by Bootstrap, never while this file is being loaded.
+   * Apps Script decides for itself in what order it evaluates the files of a
+   * project, so a module that reaches for another module at load time is a
+   * ReferenceError waiting for the day the order changes — and it takes the
+   * whole script down with it, not just one feature.
+   */
+  function install() {
+    StatusEngine.registerRule(SOURCING, SOURCING_DONE, minQuotes);
+    StatusEngine.registerRecheck(recheckMinQuotes);
+  }
 
   return {
+    install: install,
     REJECTION_REASONS: REJECTION_REASONS,
     LIST_SUMMARY_MAX_QUOTE_ROWS: LIST_SUMMARY_MAX_QUOTE_ROWS,
     loadData: loadData,

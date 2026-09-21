@@ -13,6 +13,21 @@ var StatusEngine = (function () {
 
   var rules = [];                         // { from, to, fn }
   var rechecks = [];                      // fn(caseRecord) -> { revertTo, message } | null
+  var installed = false;
+
+  /**
+   * Fills the registry the first time anything asks for it.
+   *
+   * Registration happens here, at run time, rather than while the module files
+   * are being loaded, because Apps Script picks its own file evaluation order
+   * (see Bootstrap.js). The flag is set before install() runs so a rule that
+   * registers another rule cannot recurse.
+   */
+  function ensureInstalled() {
+    if (installed) return;
+    installed = true;
+    if (typeof Bootstrap !== 'undefined') Bootstrap.install();
+  }
 
   /**
    * fn receives { user, caseRecord, from, to, reason } and throws to block.
@@ -30,12 +45,15 @@ var StatusEngine = (function () {
     rechecks.push(fn);
   }
 
+  /** Empties the registry; the defaults are reinstalled on the next use. */
   function __resetRegistry() {
     rules = [];
     rechecks = [];
+    installed = false;
   }
 
   function rulesFor(from, to) {
+    ensureInstalled();
     return rules.filter(function (r) {
       return (r.from === '*' || r.from === from) && (r.to === '*' || r.to === to);
     });
@@ -70,6 +88,7 @@ var StatusEngine = (function () {
 
   /** The buttons Case Detail should offer, already filtered by permission. */
   function allowedNextFor(user, caseRecord) {
+    ensureInstalled();
     var status = Config.getStatus(caseRecord.Status);
     if (!status) return [];
     return status.allowedNext
@@ -164,6 +183,7 @@ var StatusEngine = (function () {
 
   /** Runs every registered recheck and applies the first revert one of them asks for. */
   function runRechecks(caseRecord) {
+    ensureInstalled();
     var messages = [];
     var reverted = null;
     for (var i = 0; i < rechecks.length; i++) {
@@ -180,6 +200,7 @@ var StatusEngine = (function () {
   return {
     registerRule: registerRule,
     registerRecheck: registerRecheck,
+    ensureInstalled: ensureInstalled,
     __resetRegistry: __resetRegistry,
     rulesFor: rulesFor,
     sequenceOf: sequenceOf,
