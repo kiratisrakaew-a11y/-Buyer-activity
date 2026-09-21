@@ -42,6 +42,7 @@ const LOAD_ORDER = [
   'QuoteService.js',
   'ActivityService.js',
   'ReferenceService.js',
+  'TeamService.js',
   'Notification.js',
   'Setup.js',
   'Api.js',

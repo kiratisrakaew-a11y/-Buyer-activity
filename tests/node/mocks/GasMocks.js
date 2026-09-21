@@ -451,6 +451,7 @@ function createGasEnvironment() {
   };
 
   const ScriptApp = {
+    getService: () => ({ getUrl: () => 'https://script.google.com/a/macros/example.com/s/TEST/exec' }),
     getProjectTriggers: () => triggers.slice(),
     deleteTrigger: (t) => {
       const i = triggers.indexOf(t);

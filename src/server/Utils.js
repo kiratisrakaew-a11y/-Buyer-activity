@@ -105,6 +105,13 @@ var Utils = (function () {
     return d ? d.toISOString() : '';
   }
 
+  /** yyyy-MM-dd from a Date, using local parts. Handy for tests and date inputs. */
+  function formatDateForTest(v) {
+    var d = toDate(v);
+    if (!d) return '';
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1, 2) + '-' + pad(d.getDate(), 2);
+  }
+
   function truncate(s, max) {
     var str = String(s === null || s === undefined ? '' : s);
     return str.length <= max ? str : str.substring(0, max);
@@ -180,6 +187,7 @@ var Utils = (function () {
     addDays: addDays,
     formatDate: formatDate,
     formatDateTime: formatDateTime,
+    formatDateForTest: formatDateForTest,
     toIso: toIso,
     truncate: truncate,
     pad: pad,

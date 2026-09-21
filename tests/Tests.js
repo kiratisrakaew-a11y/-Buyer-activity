@@ -1863,3 +1863,225 @@ test('a module can register its own transition rule without touching Rules.js', 
     }
   });
 });
+
+/* ============================================================================
+ * Phase 8 — Notifications, reassignment, Team View
+ * ==========================================================================*/
+
+/** Mail sent during fn(), as an array of MailApp payloads. */
+function mailSentDuring(fn) {
+  __test.clearMail();
+  fn();
+  return __test.sentMail.slice();
+}
+
+function mailTo(messages, email) {
+  return messages.filter(function (m) { return String(m.to).indexOf(email) !== -1; });
+}
+
+test('T15 reassigning a Case moves ownership, logs REASSIGN and e-mails both buyers', function () {
+  withUsers(function () {
+    var caseId = createCaseAs(USERS.buyerA);
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_reassignCase(caseId, USERS.buyerB, 'ลองโอนเอง'), 'FORBIDDEN', 'buyers do not reassign');
+    });
+
+    var messages = mailSentDuring(function () {
+      asUser(USERS.head, function () {
+        assertApiError(api_reassignCase(caseId, USERS.buyerB, ''), 'VALIDATION', 'a reason is required');
+        assertApiError(api_reassignCase(caseId, 'ghost@example.com', 'โอน'), 'VALIDATION', 'unknown user');
+        assertApiError(api_reassignCase(caseId, USERS.auditor, 'โอน'), 'VALIDATION', 'auditors do not own work');
+        assertApiError(api_reassignCase(caseId, USERS.buyerA, 'โอน'), 'VALIDATION', 'already the owner');
+
+        var result = assertApiOk(api_reassignCase(caseId, USERS.buyerB, 'บายเออร์ เอ ลาคลอด'));
+        assertEquals(result.previousOwner, USERS.buyerA, 'previous owner reported');
+      });
+    });
+
+    assertEquals(currentCase(caseId).Buyer_Owner, USERS.buyerB, 'ownership moved');
+
+    var reassigns = logsFor('Cases', caseId).filter(function (l) { return l.Action === 'REASSIGN'; });
+    assertEquals(reassigns.length, 1, 'logged as REASSIGN');
+    assertEquals(reassigns[0].Old_Value, USERS.buyerA, 'from');
+    assertEquals(reassigns[0].New_Value, USERS.buyerB, 'to');
+    assertEquals(reassigns[0].Reason, 'บายเออร์ เอ ลาคลอด', 'with the reason');
+
+    assertEquals(mailTo(messages, USERS.buyerB).length, 1, 'the new owner is told');
+    assertEquals(mailTo(messages, USERS.buyerA).length, 1, 'and so is the previous one');
+    assertContains(mailTo(messages, USERS.buyerB)[0].subject, caseId, 'the subject names the Case');
+
+    // Buyer B can now edit; buyer A cannot.
+    asUser(USERS.buyerB, function () {
+      assertApiOk(api_updateCase(caseId, { Description: 'รับช่วงต่อ' }, currentCase(caseId).Version));
+    });
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_updateCase(caseId, { Description: 'ขอแก้' }, currentCase(caseId).Version),
+        'FORBIDDEN', 'no longer the owner');
+    });
+  });
+});
+
+test('an exception request e-mails HEAD and the decision e-mails the owner', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 2);
+
+    var requested = mailSentDuring(function () {
+      asUser(USERS.buyerA, function () {
+        assertApiOk(api_requestException(c.caseId, 'LIMITED_MARKET', 'ตลาดมีผู้ขายจำกัด'));
+      });
+    });
+    assertEquals(mailTo(requested, USERS.head).length, 1, 'the head is asked');
+
+    var decided = mailSentDuring(function () {
+      asUser(USERS.head, function () {
+        assertApiOk(api_decideException(c.caseId, true, 'เห็นชอบ'));
+      });
+    });
+    assertEquals(mailTo(decided, USERS.buyerA).length, 1, 'the owner is told the outcome');
+    assertContains(mailTo(decided, USERS.buyerA)[0].subject, 'ได้รับอนุมัติ', 'and what the outcome was');
+  });
+});
+
+test('T7b an auto-revert e-mails the Case owner and never leaks vendor contact details', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+
+    var messages = mailSentDuring(function () {
+      asUser(USERS.buyerA, function () {
+        var cv = c.caseVendors[0];
+        assertApiOk(api_updateCaseVendor(cv.Case_Vendor_ID, { Quote_Valid_Until: '2020-01-01' },
+          Repository.requireById('Case_Vendors', cv.Case_Vendor_ID).Version, 'ยืนราคาสั้น'));
+      });
+    });
+
+    var toOwner = mailTo(messages, USERS.buyerA);
+    assertEquals(toOwner.length, 1, 'the owner is told');
+    assertContains(toOwner[0].subject, 'ย้อนสถานะ', 'the subject says what happened');
+
+    // PDPA — no vendor contact detail may appear in an e-mail (SPEC §11).
+    var everything = JSON.stringify(messages);
+    Repository.readAll('Vendors').forEach(function (v) {
+      ['Contact_Phone', 'Contact_Email', 'Contact_Name', 'Address'].forEach(function (field) {
+        if (!v[field]) return;
+        assertEquals(everything.indexOf(v[field]), -1, field + ' must not appear in any e-mail');
+      });
+    });
+  });
+});
+
+test('the daily job reminds each buyer once, about their own work only', function () {
+  withUsers(function () {
+    var aCase = createCaseAs(USERS.buyerA, { Description: 'งานของเอ' });
+    var bCase = createCaseAs(USERS.buyerB, { Request_Ref: 'MEMO-B', Description: 'งานของบี' });
+
+    var yesterday = Utils.formatDateForTest(Utils.addDays(Utils.today(), -1));
+    var tomorrow = Utils.formatDateForTest(Utils.addDays(Utils.today(), 1));
+    var farFuture = Utils.formatDateForTest(Utils.addDays(Utils.today(), 30));
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveActivity(aCase, activityPayload({
+        Next_Action: 'ตามใบเสนอราคาจากผู้ขาย A', Next_Action_Date: yesterday
+      })));
+      assertApiOk(api_saveActivity(aCase, activityPayload({
+        Next_Action: 'นัดดูหน้างาน', Next_Action_Date: tomorrow
+      })));
+      assertApiOk(api_saveActivity(aCase, activityPayload({
+        Next_Action: 'เรื่องที่ยังอีกนาน', Next_Action_Date: farFuture
+      })));
+    });
+    asUser(USERS.buyerB, function () {
+      assertApiOk(api_saveActivity(bCase, activityPayload({
+        Next_Action: 'ตามเอกสารจากหน่วยงาน', Next_Action_Date: yesterday
+      })));
+    });
+
+    var digests = Notification.buildDailyDigests();
+    assertEquals(digests[USERS.buyerA].overdue.length, 1, 'A has one overdue');
+    assertEquals(digests[USERS.buyerA].upcoming.length, 1, 'and one due tomorrow');
+    assertEquals(digests[USERS.buyerB].overdue.length, 1, 'B has their own');
+
+    var messages = mailSentDuring(function () { dailyReminderJob(); });
+    assertEquals(messages.length, 2, 'one digest per buyer, not one per action');
+    assertEquals(mailTo(messages, USERS.buyerA).length, 1, 'A got exactly one');
+
+    var aMail = mailTo(messages, USERS.buyerA)[0];
+    assertContains(aMail.body, 'ตามใบเสนอราคาจากผู้ขาย A', 'listing the overdue item');
+    assertContains(aMail.body, 'นัดดูหน้างาน', 'and the one due tomorrow');
+    assertEquals(aMail.body.indexOf('เรื่องที่ยังอีกนาน'), -1, 'but not one outside the horizon');
+    assertEquals(aMail.body.indexOf('งานของบี'), -1, 'and nothing belonging to another buyer');
+  });
+});
+
+test('the daily job also catches quotations that expired without anyone writing', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'), 'all three quotations are live');
+
+    // Time passes. Writing the past expiry straight through the repository is the
+    // closest we can get to a clock moving on: no service runs, so no recheck fires.
+    c.caseVendors.forEach(function (cv) {
+      Repository.update('Case_Vendors', cv.Case_Vendor_ID,
+        { Quote_Valid_Until: Utils.addDays(Utils.today(), -1) }, null, { actor: 'SYSTEM' });
+    });
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING_DONE', 'nothing noticed yet');
+
+    // Only the scheduled job can catch an expiry that no write accompanied.
+    var result = dailyReminderJob();
+    assertEquals(result.reverted, 1, 'the job reverted the Case');
+    assertEquals(currentCase(c.caseId).Status, 'SOURCING', 'back to sourcing');
+  });
+});
+
+test('a finished Case never appears in a reminder', function () {
+  withUsers(function () {
+    var c = sourcingCase(USERS.buyerA, 3);
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveActivity(c.caseId, activityPayload({
+        Next_Action: 'สิ่งที่ค้างอยู่', Next_Action_Date: Utils.formatDateForTest(Utils.addDays(Utils.today(), -3))
+      })));
+    });
+    assertEquals(Object.keys(Notification.buildDailyDigests()).length, 1, 'reminded while open');
+
+    assertApiOk(moveTo(USERS.buyerA, c.caseId, 'SOURCING_DONE'));
+    assertApiOk(moveTo(USERS.head, c.caseId, 'CLOSED', 'จบงาน'));
+    assertDeepEquals(Notification.buildDailyDigests(), {}, 'and silent once it is closed');
+  });
+});
+
+test('Team View reports workload per buyer and is closed to buyers', function () {
+  withUsers(function () {
+    var a1 = sourcingCase(USERS.buyerA, 3);
+    var a2 = createCaseAs(USERS.buyerA, { Request_Ref: 'MEMO-A2' });
+    var b1 = sourcingCase(USERS.buyerB, 2);
+
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_saveActivity(a2, activityPayload({
+        Next_Action: 'ตามข้อมูลจากผู้ขอ',
+        Next_Action_Date: Utils.formatDateForTest(Utils.addDays(Utils.today(), -2))
+      })));
+    });
+    asUser(USERS.buyerB, function () {
+      assertApiOk(api_requestException(b1.caseId, 'URGENT', 'งานเร่ง'));
+    });
+
+    asUser(USERS.buyerA, function () {
+      assertApiError(api_teamView(), 'FORBIDDEN', 'buyers do not get the team view');
+    });
+
+    var view = asUser(USERS.head, function () { return assertApiOk(api_teamView()); });
+    var byEmail = {};
+    view.buyers.forEach(function (b) { byEmail[b.email] = b; });
+
+    assertEquals(byEmail[USERS.buyerA].openCases, 2, 'A carries two open Cases');
+    assertEquals(byEmail[USERS.buyerA].overdueActions, 1, 'one of them has slipped');
+    assertEquals(byEmail[USERS.buyerA].readyToFinish, 1, 'and one is ready to finish sourcing');
+    assertEquals(byEmail[USERS.buyerB].pendingExceptions, 1, 'B is waiting on a decision');
+    assertEquals(view.totals.openCases, 3, 'three open in total');
+    assertEquals(view.canReassign, true, 'HEAD may reassign from here');
+
+    var auditorView = asUser(USERS.auditor, function () { return assertApiOk(api_teamView()); });
+    assertEquals(auditorView.canReassign, false, 'auditors watch, they do not move work');
+  });
+});

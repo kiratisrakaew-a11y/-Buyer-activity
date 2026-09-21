@@ -290,3 +290,18 @@ function toLogClient(entry) {
     Reason: entry.Reason
   };
 }
+
+/* -------------------------------------------------------------- team view */
+
+function api_teamView() {
+  return handle('api_teamView', API_ROLES.TEAM_VIEWERS, function (user) {
+    return TeamService.overview(user);
+  });
+}
+
+/** Lets an administrator run the daily job by hand, e.g. after fixing a trigger. */
+function api_runDailyJob() {
+  return handle('api_runDailyJob', API_ROLES.ADMIN_ONLY, function () {
+    return dailyReminderJob();
+  });
+}
