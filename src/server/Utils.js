@@ -135,6 +135,27 @@ var Utils = (function () {
     });
   }
 
+  /**
+   * Turns scattered row numbers into contiguous [start, end] runs, so a caller can
+   * read them with a handful of getValues() calls instead of one per row.
+   */
+  function groupRuns(numbers) {
+    var sorted = numbers.slice().sort(function (a, b) { return a - b; });
+    var runs = [];
+    var start = null;
+    var previous = null;
+    sorted.forEach(function (n) {
+      if (start === null) { start = n; previous = n; return; }
+      if (n === previous) return;                 // duplicates collapse
+      if (n === previous + 1) { previous = n; return; }
+      runs.push([start, previous]);
+      start = n;
+      previous = n;
+    });
+    if (start !== null) runs.push([start, previous]);
+    return runs;
+  }
+
   /** Groups rows by the value of `key`, preserving input order within each group. */
   function groupBy(rows, key) {
     var out = {};
@@ -164,6 +185,7 @@ var Utils = (function () {
     pad: pad,
     normalizeForCompare: normalizeForCompare,
     unique: unique,
+    groupRuns: groupRuns,
     groupBy: groupBy
   };
 })();

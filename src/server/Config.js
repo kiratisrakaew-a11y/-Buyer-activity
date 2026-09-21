@@ -25,6 +25,7 @@ var Config = (function () {
   };
 
   var dbOverride = null;                  // set by Tests.js to point at a scratch spreadsheet
+  var dbMemo = null;                      // openById() is an API call; do it once per execution
   var memo = {};                          // per-execution memo, never outlives the request
 
   /* ------------------------------------------------------------ spreadsheet */
@@ -32,21 +33,25 @@ var Config = (function () {
   /** Tests call this to run against a throwaway spreadsheet instead of the real DB. */
   function __setDbOverride(ss) {
     dbOverride = ss;
+    dbMemo = null;
     resetMemo();
   }
 
   function __clearDbOverride() {
     dbOverride = null;
+    dbMemo = null;
     resetMemo();
   }
 
   function getDb() {
     if (dbOverride) return dbOverride;
+    if (dbMemo) return dbMemo;
     var id = PropertiesService.getScriptProperties().getProperty(DB_PROPERTY_KEY);
     if (!id) {
       throw Err.internal('ยังไม่ได้ตั้งค่าไฟล์ฐานข้อมูล — ผู้ดูแลระบบต้องรัน setup() ก่อน');
     }
-    return SpreadsheetApp.openById(id);
+    dbMemo = SpreadsheetApp.openById(id);
+    return dbMemo;
   }
 
   function getSheet(sheetName) {
@@ -68,6 +73,7 @@ var Config = (function () {
 
   function resetMemo() {
     memo = {};
+    dbMemo = null;
   }
 
   function cacheGet(key) {

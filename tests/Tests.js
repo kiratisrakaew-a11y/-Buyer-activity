@@ -267,3 +267,261 @@ test('T2 concurrent id allocation never repeats a number', function () {
     assert(!Utils.isLockHeld(), 'script lock released after allocation');
   });
 });
+
+/* ============================================================================
+ * Phase 2 — Repository, Change_Log, optimistic locking, soft delete
+ * ==========================================================================*/
+
+/** Change_Log rows for one record, oldest first. */
+function logsFor(tableName, recordId) {
+  return Repository.readAll('Change_Log').filter(function (l) {
+    return l.Table_Name === tableName && l.Record_ID === recordId;
+  });
+}
+
+function makeVendor(overrides) {
+  var payload = {
+    Vendor_Name: 'บริษัท ทดสอบ จำกัด',
+    Tax_ID: '0105500000001',
+    Contact_Phone: '021112222',
+    Contact_Email: 'sales@vendor.example',
+    Vendor_Status: 'NEW'
+  };
+  Object.keys(overrides || {}).forEach(function (k) { payload[k] = overrides[k]; });
+  return Repository.insert('Vendors', payload, { actor: 'buyer.a@example.com' });
+}
+
+test('Repository.insert fills audit columns and logs a CREATE', function () {
+  withFreshDatabase(function () {
+    var vendor = makeVendor();
+
+    assertEquals(vendor.Vendor_ID, 'VEN-00001', 'generated id');
+    assertEquals(vendor.Version, 1, 'version starts at 1');
+    assertEquals(vendor.Is_Deleted, false, 'not deleted');
+    assertEquals(vendor.Created_By, 'buyer.a@example.com', 'Created_By');
+    assertEquals(vendor.Updated_By, 'buyer.a@example.com', 'Updated_By');
+    assert(vendor.Created_At instanceof Date, 'Created_At is a date');
+
+    var logs = logsFor('Vendors', 'VEN-00001');
+    assertEquals(logs.length, 1, 'one CREATE entry');
+    assertEquals(logs[0].Action, 'CREATE', 'action');
+    assertEquals(logs[0].Field, '', 'CREATE has no field (SPEC 5.4)');
+    assertContains(logs[0].New_Value, 'Tax_ID=0105500000001', 'CREATE snapshot');
+
+    // Reading it back by id returns the same record.
+    var reread = Repository.requireById('Vendors', 'VEN-00001');
+    assertEquals(reread.Vendor_Name, 'บริษัท ทดสอบ จำกัด', 'round trip');
+  });
+});
+
+test('Repository.insert ignores client-supplied ids and audit columns', function () {
+  withFreshDatabase(function () {
+    var vendor = Repository.insert('Vendors', {
+      Vendor_ID: 'VEN-99999',
+      Vendor_Name: 'ผู้ขายปลอม',
+      Tax_ID: '0105500000002',
+      Vendor_Status: 'APPROVED',
+      Version: 42,
+      Is_Deleted: true,
+      Created_By: 'attacker@example.com'
+    }, { actor: 'buyer.a@example.com' });
+
+    assertEquals(vendor.Vendor_ID, 'VEN-00001', 'system issues the id');
+    assertEquals(vendor.Version, 1, 'client Version ignored');
+    assertEquals(vendor.Is_Deleted, false, 'client Is_Deleted ignored');
+    assertEquals(vendor.Created_By, 'buyer.a@example.com', 'client Created_By ignored');
+  });
+});
+
+test('T12 update logs one row per changed field with old, new and reason', function () {
+  withFreshDatabase(function () {
+    makeVendor();
+    var updated = Repository.update('Vendors', 'VEN-00001', {
+      Vendor_Name: 'บริษัท ทดสอบ (แก้ไข) จำกัด',
+      Contact_Phone: '029998888',
+      Vendor_Status: 'NEW'                      // unchanged — must not be logged
+    }, 1, { actor: 'head@example.com', reason: 'แก้ชื่อตามหนังสือรับรอง' });
+
+    assertEquals(updated.Version, 2, 'version bumped once for the whole update');
+    assertEquals(updated.Updated_By, 'head@example.com', 'Updated_By');
+
+    var changes = logsFor('Vendors', 'VEN-00001').filter(function (l) { return l.Action === 'UPDATE'; });
+    assertEquals(changes.length, 2, 'only the two fields that actually changed');
+
+    var byField = {};
+    changes.forEach(function (c) { byField[c.Field] = c; });
+    assert(!byField.Vendor_Status, 'an unchanged field is not logged');
+    assertEquals(byField.Vendor_Name.Old_Value, 'บริษัท ทดสอบ จำกัด', 'old value');
+    assertEquals(byField.Vendor_Name.New_Value, 'บริษัท ทดสอบ (แก้ไข) จำกัด', 'new value');
+    assertEquals(byField.Vendor_Name.Reason, 'แก้ชื่อตามหนังสือรับรอง', 'reason');
+    assertEquals(byField.Contact_Phone.New_Value, '029998888', 'second field');
+
+    // Audit columns never appear as their own log rows.
+    changes.forEach(function (c) {
+      assert(!Schema.isAuditColumn(c.Field), 'audit column ' + c.Field + ' must not be logged');
+    });
+  });
+});
+
+test('T11 a stale version is rejected with CONFLICT', function () {
+  withFreshDatabase(function () {
+    makeVendor();
+
+    // Two users opened the same form; both hold version 1.
+    Repository.update('Vendors', 'VEN-00001', { Vendor_Name: 'บันทึกโดยคนแรก' }, 1,
+      { actor: 'user1@example.com' });
+
+    var error = assertThrowsCode('CONFLICT', function () {
+      Repository.update('Vendors', 'VEN-00001', { Vendor_Name: 'บันทึกโดยคนที่สอง' }, 1,
+        { actor: 'user2@example.com' });
+    }, 'second save must conflict');
+    assertEquals(error.details.expected, 1, 'conflict reports the version sent');
+    assertEquals(error.details.actual, 2, 'conflict reports the stored version');
+
+    assertEquals(Repository.requireById('Vendors', 'VEN-00001').Vendor_Name, 'บันทึกโดยคนแรก',
+      'the losing write changed nothing');
+
+    // Reloading and retrying with the current version succeeds.
+    Repository.update('Vendors', 'VEN-00001', { Vendor_Name: 'บันทึกโดยคนที่สอง' }, 2,
+      { actor: 'user2@example.com' });
+    assertEquals(Repository.requireById('Vendors', 'VEN-00001').Version, 3, 'retry applied');
+  });
+});
+
+test('update with no real change leaves the version alone', function () {
+  withFreshDatabase(function () {
+    makeVendor();
+    var same = Repository.update('Vendors', 'VEN-00001', { Vendor_Name: 'บริษัท ทดสอบ จำกัด' }, 1,
+      { actor: 'buyer.a@example.com' });
+    assertEquals(same.Version, 1, 'version unchanged');
+    assertEquals(logsFor('Vendors', 'VEN-00001').length, 1, 'only the CREATE entry exists');
+  });
+});
+
+test('softDelete hides the row, keeps it in the sheet and logs DELETE', function () {
+  withFreshDatabase(function () {
+    makeVendor();
+    var sheetRowsBefore = Config.getSheet('Vendors').getLastRow();
+
+    Repository.softDelete('Vendors', 'VEN-00001', 1, { actor: 'admin@example.com', reason: 'สร้างซ้ำ' });
+
+    assertEquals(Config.getSheet('Vendors').getLastRow(), sheetRowsBefore, 'no row was removed');
+    assertEquals(Repository.findById('Vendors', 'VEN-00001'), null, 'hidden from normal reads');
+    assert(!!Repository.findById('Vendors', 'VEN-00001', { includeDeleted: true }), 'still reachable for audit');
+    assertEquals(Repository.query('Vendors').length, 0, 'excluded from queries');
+    assertEquals(Repository.query('Vendors', { includeDeleted: true }).length, 1, 'included when asked');
+
+    var del = logsFor('Vendors', 'VEN-00001').filter(function (l) { return l.Action === 'DELETE'; });
+    assertEquals(del.length, 1, 'one DELETE entry');
+    assertEquals(del[0].Reason, 'สร้างซ้ำ', 'reason recorded');
+
+    Repository.restore('Vendors', 'VEN-00001', null, { actor: 'admin@example.com', reason: 'ลบผิด' });
+    assert(!!Repository.findById('Vendors', 'VEN-00001'), 'restored');
+    assertEquals(logsFor('Vendors', 'VEN-00001').filter(function (l) { return l.Action === 'RESTORE'; }).length,
+      1, 'one RESTORE entry');
+  });
+});
+
+test('fieldActions let a caller label a change STATUS_CHANGE instead of UPDATE', function () {
+  withFreshDatabase(function () {
+    makeVendor();
+    Repository.update('Vendors', 'VEN-00001', { Vendor_Status: 'BLACKLIST' }, 1, {
+      actor: 'admin@example.com',
+      reason: 'พบพฤติกรรมสมยอมราคา',
+      fieldActions: { Vendor_Status: ChangeLog.ACTIONS.STATUS_CHANGE }
+    });
+    var logs = logsFor('Vendors', 'VEN-00001');
+    assertEquals(logs[logs.length - 1].Action, 'STATUS_CHANGE', 'action overridden per field');
+  });
+});
+
+test('updateMany applies a batch and writes all entries at once', function () {
+  withFreshDatabase(function () {
+    var a = makeVendor({ Tax_ID: '0105500000011', Vendor_Name: 'ผู้ขาย A' });
+    var b = makeVendor({ Tax_ID: '0105500000012', Vendor_Name: 'ผู้ขาย B' });
+
+    var result = Repository.updateMany('Vendors', [
+      { id: a.Vendor_ID, patch: { Vendor_Status: 'APPROVED' }, version: 1 },
+      { id: b.Vendor_ID, patch: { Vendor_Status: 'APPROVED' }, version: 1 }
+    ], { actor: 'admin@example.com', reason: 'ผ่านการตรวจสอบ' });
+
+    assertEquals(result.length, 2, 'both returned');
+    assertEquals(Repository.requireById('Vendors', a.Vendor_ID).Vendor_Status, 'APPROVED', 'first applied');
+    assertEquals(Repository.requireById('Vendors', b.Vendor_ID).Version, 2, 'second version bumped');
+
+    assertThrowsCode('CONFLICT', function () {
+      Repository.updateMany('Vendors', [{ id: a.Vendor_ID, patch: { Vendor_Status: 'NEW' }, version: 1 }],
+        { actor: 'admin@example.com' });
+    }, 'batch honours optimistic locking too');
+  });
+});
+
+test('Repository coerces types on the way in and out of the sheet', function () {
+  withFreshDatabase(function () {
+    var stored = Repository.insert('Case_Items', {
+      Case_ID: 'SRC-2026-0001',
+      Line_No: '2',
+      Item_Description: 'จอ LED P4',
+      Quantity: '12.5',
+      Unit: 'SQM'
+    }, { actor: 'buyer.a@example.com' });
+
+    assertEquals(stored.Line_No, 2, 'int coerced');
+    assertEquals(stored.Quantity, 12.5, 'number coerced');
+
+    var read = Repository.requireById('Case_Items', stored.Item_Row_ID);
+    assertEquals(typeof read.Quantity, 'number', 'reads back as a number');
+    assertEquals(read.Is_Deleted, false, 'bool reads back as a boolean');
+
+    assertThrowsCode('VALIDATION', function () {
+      Repository.update('Case_Items', stored.Item_Row_ID, { Quantity: 'สิบสอง' }, 1,
+        { actor: 'buyer.a@example.com' });
+    }, 'non-numeric quantity rejected');
+  });
+});
+
+test('queryByCase finds only the rows of that Case', function () {
+  withFreshDatabase(function () {
+    ['SRC-2026-0001', 'SRC-2026-0001', 'SRC-2026-0002'].forEach(function (caseId, i) {
+      Repository.insert('Case_Items', {
+        Case_ID: caseId, Line_No: i + 1, Item_Description: 'รายการ ' + (i + 1),
+        Quantity: 1, Unit: 'PCS'
+      }, { actor: 'buyer.a@example.com' });
+    });
+
+    assertEquals(Repository.queryByCase('Case_Items', 'SRC-2026-0001').length, 2, 'two rows for case 1');
+    assertEquals(Repository.queryByCase('Case_Items', 'SRC-2026-0002').length, 1, 'one row for case 2');
+    assertEquals(Repository.queryByCase('Case_Items', 'SRC-2026-0009').length, 0, 'none for an unknown case');
+  });
+});
+
+test('softDeleteWhere cascades and every removal is logged', function () {
+  withFreshDatabase(function () {
+    for (var i = 0; i < 3; i++) {
+      Repository.insert('Quote_Lines', {
+        Case_ID: 'SRC-2026-0001', Case_Vendor_ID: 'CV-000001', Item_Row_ID: 'ITM-00000' + i,
+        Vendor_Unit: 'PCS', Vendor_Unit_Price: 100 + i
+      }, { actor: 'buyer.a@example.com' });
+    }
+    var removed = Repository.softDeleteWhere('Quote_Lines', 'Case_Vendor_ID', 'CV-000001',
+      { actor: 'buyer.a@example.com', reason: 'ลบ vendor ออกจากงาน' });
+
+    assertEquals(removed, 3, 'all three cascaded');
+    assertEquals(Repository.queryByCase('Quote_Lines', 'SRC-2026-0001').length, 0, 'none visible');
+    var deletes = Repository.readAll('Change_Log').filter(function (l) {
+      return l.Table_Name === 'Quote_Lines' && l.Action === 'DELETE';
+    });
+    assertEquals(deletes.length, 3, 'one DELETE entry per row');
+  });
+});
+
+test('Change_Log has no update or delete API', function () {
+  assertEquals(typeof ChangeLog.update, 'undefined', 'no ChangeLog.update');
+  assertEquals(typeof ChangeLog.remove, 'undefined', 'no ChangeLog.remove');
+  assertEquals(Schema.getTable('Change_Log').appendOnly, true, 'schema marks it append-only');
+  withFreshDatabase(function () {
+    assertThrowsCode('INTERNAL', function () {
+      Repository.update('Change_Log', 'LOG-00000001', { Reason: 'แก้ประวัติ' }, null, { actor: 'x@example.com' });
+    }, 'Repository refuses to update an append-only table');
+  });
+});
