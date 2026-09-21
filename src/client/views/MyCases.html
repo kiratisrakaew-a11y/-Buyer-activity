@@ -10,7 +10,12 @@
   function render(host) {
     host.innerHTML = shell();
     bindFilters(host);
-    host.querySelector('#newCaseBtn').onclick = openNewCaseDialog;
+    // The button only exists for roles that may open a Case, so an ADMIN or an
+    // AUDITOR lands here with nothing to bind. Reaching through the null is what
+    // took the whole page down for the very first person to install the system,
+    // since setup() makes whoever runs it an ADMIN.
+    var newCase = host.querySelector('#newCaseBtn');
+    if (newCase) newCase.onclick = openNewCaseDialog;
     load(host);
   }
 

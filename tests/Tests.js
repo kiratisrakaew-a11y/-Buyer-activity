@@ -2426,3 +2426,50 @@ test('api_verifyDeployment is restricted to ADMIN', function () {
     });
   });
 });
+
+/* ============================================================================
+ * Client views — a button that only some roles see must never be bound blindly
+ *
+ * Eight buttons in the UI are rendered only when the signed-in role is allowed
+ * to use them. Binding one without checking it exists throws, and because the
+ * view renders in one pass, that throw takes the entire page down rather than
+ * disabling one button. setup() makes the first installer an ADMIN, who may not
+ * open Cases, so the one place this was missed broke the first screen for the
+ * first user of every new installation.
+ *
+ * Node-only: it reads the client files, which the runner hands to the mock.
+ * ==========================================================================*/
+
+if (typeof __test !== 'undefined') {
+
+  test('every conditionally rendered control is null-checked before binding', function () {
+    var files = __test.defaultHtmlFiles;
+    var offenders = [];
+    var checked = 0;
+
+    Object.keys(files).forEach(function (name) {
+      var source = files[name];
+
+      // Ids emitted from inside a ternary are the ones that may be absent.
+      var conditional = {};
+      var pattern = /\?\s*'<[^']*id="([A-Za-z0-9_-]+)"/g;
+      var match;
+      while ((match = pattern.exec(source)) !== null) {
+        conditional[match[1]] = true;
+      }
+
+      Object.keys(conditional).forEach(function (id) {
+        checked++;
+        // Flags querySelector('#id').something — the reach-through that throws.
+        var chained = new RegExp("querySelector\\(['\"]#" + id + "['\"]\\)\\s*\\.");
+        if (chained.test(source)) {
+          offenders.push(name + ' → #' + id);
+        }
+      });
+    });
+
+    assert(checked >= 8, 'the scan found the conditional controls (found ' + checked + ')');
+    assertEquals(offenders.join(', '), '',
+      'these controls are bound without checking they exist: ' + offenders.join(', '));
+  });
+}
