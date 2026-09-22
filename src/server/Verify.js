@@ -75,6 +75,38 @@ var Verify = (function () {
       return pass('ครบทั้ง ' + Schema.tableNames().length + ' ตาราง');
     });
 
+    // The counter that mints primary keys once handed the same id out twice,
+    // because writes were not being flushed before the lock was released. The
+    // code is fixed; the rows it already wrote are not, and a duplicate key is
+    // invisible until something reads by that key and silently gets the wrong
+    // row. This finds every one of them in one pass.
+    check(checks, 'duplicateIds', 'รหัสประจำตัว (primary key) ไม่ซ้ำ', function () {
+      var live = [];
+      var deletedOnly = [];
+
+      Schema.tableNames().forEach(function (tableName) {
+        var table = Schema.getTable(tableName);
+        if (!table.pk) return;
+        var counts = countKeys(tableName, table);
+        if (counts === null) return;                  // empty sheet, nothing to compare
+        if (counts.live.length) live.push(table.sheet + ': ' + counts.live.join(', '));
+        if (counts.withDeleted.length) {
+          deletedOnly.push(table.sheet + ': ' + counts.withDeleted.join(', '));
+        }
+      });
+
+      if (live.length) {
+        return fail('พบรหัสซ้ำในแถวที่ใช้งานอยู่ — ' + live.join(' · ') +
+          ' · ระบบจะอ่านข้อมูลผิดแถว กรุณาแก้รหัสของแถวที่ยังไม่มีใครอ้างถึงให้เป็นเลขใหม่ ' +
+          'แล้วตั้ง Last_No ในชีต Counters ให้สูงกว่าเลขที่ใช้อยู่ทั้งหมด');
+      }
+      if (deletedOnly.length) {
+        return warn('รหัสซ้ำเฉพาะกับแถวที่ถูกลบไปแล้ว — ' + deletedOnly.join(' · ') +
+          ' · ระบบยังอ่านถูกแถว แต่ประวัติการแก้ไขจะอ่านยาก');
+      }
+      return pass('ไม่มีรหัสซ้ำในทุกตาราง');
+    });
+
     // The one thing the Node tests cannot prove: that clasp named the files the
     // way this code asks for them.
     check(checks, 'htmlFiles', 'ไฟล์หน้าเว็บ (ตรวจชื่อที่ clasp ตั้งให้จริง)', function () {
@@ -244,6 +276,45 @@ var Verify = (function () {
   }
 
   /** Runs one check, turning any throw into a FAIL so the rest still run. */
+  /**
+   * Counts primary keys in one table, reading only the columns it needs.
+   *
+   * Returns the ids that appear more than once among live rows, and separately
+   * those that only collide once deleted rows are counted too. Reads the key
+   * column (and Is_Deleted, when the table has one) rather than whole rows, so
+   * this stays affordable on the biggest sheets.
+   */
+  function countKeys(tableName, table) {
+    var meta = Repository.getHeaders(tableName);
+    var lastRow = meta.sheet.getLastRow();
+    if (lastRow < 2) return null;
+
+    var keyColumn = meta.index[table.pk];
+    if (keyColumn === undefined) return null;         // the sheets check reports this
+    var keys = meta.sheet.getRange(2, keyColumn + 1, lastRow - 1, 1).getValues();
+
+    var deletedColumn = meta.index.Is_Deleted;
+    var deleted = deletedColumn === undefined ? null
+      : meta.sheet.getRange(2, deletedColumn + 1, lastRow - 1, 1).getValues();
+
+    var liveCount = {};
+    var allCount = {};
+    for (var i = 0; i < keys.length; i++) {
+      var id = String(keys[i][0]).trim();
+      if (!id) continue;
+      allCount[id] = (allCount[id] || 0) + 1;
+      var isDeleted = deleted !== null &&
+        (deleted[i][0] === true || String(deleted[i][0]).trim().toUpperCase() === 'TRUE');
+      if (!isDeleted) liveCount[id] = (liveCount[id] || 0) + 1;
+    }
+
+    var live = Object.keys(liveCount).filter(function (id) { return liveCount[id] > 1; });
+    var withDeleted = Object.keys(allCount).filter(function (id) {
+      return allCount[id] > 1 && live.indexOf(id) === -1;
+    });
+    return { live: live.sort(), withDeleted: withDeleted.sort() };
+  }
+
   function check(checks, id, title, fn) {
     var result;
     try {

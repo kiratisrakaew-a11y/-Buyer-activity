@@ -2556,14 +2556,127 @@ if (typeof __test !== 'undefined') {
 test('verifyDeployment reports a broken Drive folder id rather than throwing', function () {
   withFreshDatabase(function () {
     seedUsers();
-    assertEquals(checkById(Verify.run(), 'driveFolder').status, 'WARN', 'blank means auto-create');
+    var healthy = Verify.run();
+    assertEquals(checkById(healthy, 'driveFolder').status, 'WARN', 'blank means auto-create');
 
     Config.setSetting('DRIVE_ROOT_FOLDER_ID', 'folder_that_does_not_exist');
     var broken = checkById(Verify.run(), 'driveFolder');
     assertEquals(broken.status, 'FAIL', 'set but unreachable is a real problem');
 
-    // One bad check must not stop the others from running.
-    assertEquals(Verify.run().checks.length, 12, 'every check still ran');
+    // One bad check must not stop the others from running. Counted against the
+    // healthy run rather than a literal, so adding a check does not fail this.
+    assertEquals(Verify.run().checks.length, healthy.checks.length, 'every check still ran');
+    assert(healthy.checks.length >= 12, 'and there is a real checklist to run');
+  });
+});
+
+/* ============================================================================
+ * Duplicate primary keys
+ *
+ * The counter that mints ids once handed the same one out twice, because writes
+ * were not flushed before the lock was released. The flush is fixed, but rows
+ * written before that keep their shared ids, and the failure was invisible:
+ * findById took the first match, so a vendor who had never been invited to a
+ * Case came back as "already invited" — the duplicate check was comparing a real
+ * id against a row belonging to a different company.
+ * ==========================================================================*/
+
+/** Rewrites one row's primary key, which is what the id collision looked like. */
+function forceDuplicateKey(tableName, idToBreak, idToUse) {
+  var table = Schema.getTable(tableName);
+  var sheet = Config.getSheet(table.sheet);
+  var meta = Repository.getHeaders(tableName);
+  var column = meta.index[table.pk] + 1;
+  var keys = sheet.getRange(2, column, sheet.getLastRow() - 1, 1).getValues();
+  for (var i = 0; i < keys.length; i++) {
+    if (String(keys[i][0]).trim() === idToBreak) {
+      sheet.getRange(i + 2, column, 1, 1).setValues([[idToUse]]);
+      Repository.resetCache(tableName);
+      return i + 2;
+    }
+  }
+  throw new Error('no row holding ' + idToBreak + ' in ' + tableName);
+}
+
+test('findById refuses to guess when two live rows share one primary key', function () {
+  withUsers(function () {
+    var first = createVendorAs(USERS.admin).vendor;
+    createVendorAs(USERS.admin, { Vendor_Name: 'บริษัท อื่น จำกัด', Tax_ID: '0105500000002' });
+    var brokenRow = forceDuplicateKey('Vendors', 'VEN-00002', first.Vendor_ID);
+
+    var threw = null;
+    try {
+      Repository.findById('Vendors', first.Vendor_ID);
+    } catch (e) {
+      threw = e;
+    }
+    assert(!!threw, 'reading an ambiguous id is an error, not a coin flip');
+    assertEquals(threw.code, 'INTERNAL', 'reported as a broken sheet');
+    assertContains(threw.message, first.Vendor_ID, 'the message names the id');
+    assertContains(threw.message, 'Vendors', 'and the sheet it is in');
+    assertContains(threw.message, String(brokenRow), 'and the row to go and look at');
+  });
+});
+
+test('a duplicate Vendor_ID no longer reports the wrong vendor as already invited', function () {
+  withUsers(function () {
+    var invited = createVendorAs(USERS.admin).vendor;
+    var neverInvited = createVendorAs(USERS.admin, {
+      Vendor_Name: 'บจก. ที่ยังไม่ได้เชิญ', Tax_ID: '0105500000002'
+    }).vendor;
+
+    var caseId = createCaseAs(USERS.buyerA);
+    asUser(USERS.buyerA, function () {
+      assertApiOk(api_addVendorToCase(caseId, invited.Vendor_ID, { Invite_Channel: 'EMAIL' }));
+    });
+
+    // Both companies now claim the same id, exactly as the counter left them.
+    forceDuplicateKey('Vendors', neverInvited.Vendor_ID, invited.Vendor_ID);
+
+    var error = asUser(USERS.buyerA, function () {
+      return assertApiError(
+        api_addVendorToCase(caseId, invited.Vendor_ID, { Invite_Channel: 'EMAIL' }),
+        'INTERNAL', 'the broken data is reported, not worked around');
+    });
+    assertContains(error.message, 'Vendors', 'and it says where to look');
+    assertEquals(Repository.queryByCase('Case_Vendors', caseId).length, 1,
+      'and nothing was added on the back of an ambiguous read');
+  });
+});
+
+test('a deleted row sharing an id is not ambiguous, so the live row still wins', function () {
+  withUsers(function () {
+    var live = createVendorAs(USERS.admin).vendor;
+    var gone = createVendorAs(USERS.admin, {
+      Vendor_Name: 'บจก. ที่ถูกลบแล้ว', Tax_ID: '0105500000002'
+    }).vendor;
+
+    Repository.softDelete('Vendors', gone.Vendor_ID, gone.Version,
+      { actor: USERS.admin, reason: 'เพิ่มผิด' });
+    forceDuplicateKey('Vendors', gone.Vendor_ID, live.Vendor_ID);
+
+    var found = Repository.findById('Vendors', live.Vendor_ID);
+    assertEquals(found.Vendor_Name, live.Vendor_Name, 'the one row still in use is returned');
+
+    var check = checkById(Verify.run(), 'duplicateIds');
+    assertEquals(check.status, 'WARN', 'worth cleaning up, but nothing is reading the wrong row');
+  });
+});
+
+test('verifyDeployment finds every duplicated primary key in one pass', function () {
+  withFreshDatabase(function () {
+    seedUsers();
+    assertEquals(checkById(Verify.run(), 'duplicateIds').status, 'PASS', 'a clean database');
+
+    createVendorAs(USERS.admin);
+    createVendorAs(USERS.admin, { Vendor_Name: 'บจก. สอง', Tax_ID: '0105500000002' });
+    forceDuplicateKey('Vendors', 'VEN-00002', 'VEN-00001');
+
+    var check = checkById(Verify.run(), 'duplicateIds');
+    assertEquals(check.status, 'FAIL', 'a shared id among live rows is a real fault');
+    assertContains(check.detail, 'Vendors', 'names the sheet');
+    assertContains(check.detail, 'VEN-00001', 'names the id');
+    assertContains(check.detail, 'Counters', 'and says to raise the counter as well');
   });
 });
 

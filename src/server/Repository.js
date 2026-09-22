@@ -247,18 +247,44 @@ var Repository = (function () {
     return query(tableName, options);
   }
 
+  /**
+   * One record by primary key, or null.
+   *
+   * Refuses to guess when two live rows carry the same key. Taking the first of
+   * them looks harmless on a read and is not: the next update writes to whichever
+   * row happened to come first, and a caller comparing ids reaches a row that is
+   * not the one on screen. That is how a vendor who was never invited to a Case
+   * came back as "already invited" — two Vendors rows were sharing one Vendor_ID
+   * after the counter handed the same id out twice. A duplicate key is a broken
+   * sheet, and the error says which rows to look at.
+   *
+   * A deleted row alongside a live one is not ambiguous, so the live one wins.
+   */
   function findById(tableName, id, opts) {
     var options = opts || {};
     var table = Schema.getTable(tableName);
     if (!table.pk) throw Err.internal('ตาราง ' + tableName + ' ไม่มี primary key');
     if (Utils.isBlank(id)) return null;
 
-    var records = readRowNumbers(tableName, findRowNumbers(tableName, table.pk, id))
+    var matches = readRowNumbers(tableName, findRowNumbers(tableName, table.pk, id))
       .filter(function (r) { return Utils.normalizeForCompare(r[table.pk]) === Utils.normalizeForCompare(id); });
-    if (records.length === 0) return null;
-    var record = records[0];
-    if (table.audit && record.Is_Deleted === true && !options.includeDeleted) return null;
-    return record;
+    if (matches.length === 0) return null;
+
+    var records = matches;
+    if (table.audit && !options.includeDeleted) {
+      records = matches.filter(function (r) { return r.Is_Deleted !== true; });
+      if (records.length === 0) return null;
+    }
+
+    if (records.length > 1) {
+      throw Err.internal(
+        '\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25\u0e02\u0e31\u0e14\u0e41\u0e22\u0e49\u0e07: \u0e23\u0e2b\u0e31\u0e2a ' + id + ' \u0e21\u0e35\u0e2d\u0e22\u0e39\u0e48 ' + records.length +
+        ' \u0e41\u0e16\u0e27\u0e43\u0e19\u0e0a\u0e35\u0e15 ' + table.sheet + ' (\u0e41\u0e16\u0e27\u0e17\u0e35\u0e48 ' +
+        records.map(function (r) { return r[ROW_KEY]; }).join(', ') +
+        ') \u2014 \u0e23\u0e2b\u0e31\u0e2a\u0e19\u0e35\u0e49\u0e15\u0e49\u0e2d\u0e07\u0e44\u0e21\u0e48\u0e0b\u0e49\u0e33 \u0e01\u0e23\u0e38\u0e13\u0e32\u0e40\u0e01\u0e47\u0e1a\u0e02\u0e49\u0e2d\u0e21\u0e39\u0e25\u0e41\u0e25\u0e49\u0e27\u0e41\u0e01\u0e49\u0e43\u0e2b\u0e49\u0e40\u0e2b\u0e25\u0e37\u0e2d\u0e41\u0e16\u0e27\u0e40\u0e14\u0e35\u0e22\u0e27',
+        { table: tableName, id: id, rows: records.map(function (r) { return r[ROW_KEY]; }) });
+    }
+    return records[0];
   }
 
   function requireById(tableName, id, opts) {
