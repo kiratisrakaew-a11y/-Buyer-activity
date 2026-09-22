@@ -1,0 +1,259 @@
+<script>
+/**
+ * Status changes, exceptions, reopen, and the PR numbers a Case produces.
+ *
+ * The buttons offered come from StatusEngine.allowedNextFor on the server, so
+ * the screen can never offer a move the server would refuse, and a move that is
+ * backwards or a cancellation asks for its reason before it is sent (SPEC §6.3).
+ */
+(function () {
+
+  /* ------------------------------------------------------- change status */
+
+  App.registerCaseHeaderAction({
+    label: 'เปลี่ยนสถานะ',
+    className: 'primary',
+    visible: function (ctx) {
+      return ctx.canEdit && ctx.bundle.nextStatuses && ctx.bundle.nextStatuses.length > 0;
+    },
+    run: openStatusDialog
+  });
+
+  function openStatusDialog(ctx) {
+    var options = ctx.bundle.nextStatuses.map(function (s) {
+      return '<label class="field-inline" style="margin-bottom:8px">' +
+        '<input type="radio" name="toStatus" value="' + App.esc(s.code) + '" required>' +
+        '<span>' + App.esc(s.label) +
+          (s.backwards ? ' <span class="badge warn">ย้อนสถานะ</span>' : '') +
+          (s.requiresReason ? ' <span class="faint">ต้องระบุเหตุผล</span>' : '') +
+        '</span></label>';
+    }).join('');
+
+    var blockers = ctx.rules ? ctx.rules.blockers : [];
+
+    App.modal({
+      title: 'เปลี่ยนสถานะงาน ' + ctx.caseId,
+      submitLabel: 'เปลี่ยนสถานะ',
+      body:
+        App.alertHtml('error', 'ยังมีเงื่อนไขที่ไม่ผ่าน', blockers) +
+        '<p class="muted">สถานะปัจจุบัน: <strong>' + App.esc(App.statusLabel(ctx.caseRecord.Status)) +
+          '</strong></p>' + options +
+        '<div class="field" style="margin-top:12px"><label for="statusReason">เหตุผล</label>' +
+          '<textarea id="statusReason" name="reason" maxlength="500" ' +
+          'placeholder="บังคับเมื่อย้อนสถานะหรือยกเลิกงาน"></textarea></div>',
+      onSubmit: function (form, close) {
+        var chosen = form.querySelector('input[name="toStatus"]:checked');
+        if (!chosen) return;
+        App.api('api_changeStatus', ctx.caseId, chosen.value, ctx.caseRecord.Version,
+          form.reason.value.trim())
+          .then(function (result) {
+            close();
+            App.toast('เปลี่ยนสถานะเป็น ' + App.statusLabel(result.to) + ' แล้ว', 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+      }
+    });
+  }
+
+  /* ----------------------------------------------------------- exception */
+
+  App.registerCaseHeaderAction({
+    label: 'ขอยกเว้นจำนวนใบเสนอราคา',
+    visible: function (ctx) {
+      if (!ctx.canEdit || !ctx.rules) return false;
+      if (ctx.caseRecord.Exception_Status === 'PENDING') return false;
+      // Only worth offering while the Case actually falls short of the rule.
+      return ctx.rules.blockers.length > 0 && ctx.rules.quotes.valid > 0;
+    },
+    run: function (ctx) {
+      App.modal({
+        title: 'ขอยกเว้นจำนวนใบเสนอราคา',
+        submitLabel: 'ส่งคำขอ',
+        body:
+          '<p class="muted">มีใบเสนอราคาที่ใช้ได้ ' + App.esc(ctx.rules.quotes.valid) + ' ราย ' +
+            'จากที่กำหนด ' + App.esc(ctx.rules.quotes.required) + ' ราย ' +
+            'คำขอนี้ต้องได้รับอนุมัติจากหัวหน้าฝ่ายจัดซื้อก่อน</p>' +
+          '<div class="field"><label for="excReason">เหตุผลของการยกเว้น <span class="req">*</span></label>' +
+            '<select id="excReason" name="reasonCode" required>' +
+            App.optionsFor('EXCEPTION_REASON', '') + '</select></div>' +
+          '<div class="field"><label for="excNote">คำอธิบายประกอบ <span class="req">*</span></label>' +
+            '<textarea id="excNote" name="note" required maxlength="2000" ' +
+            'placeholder="อธิบายให้ผู้อนุมัติและผู้ตรวจสอบเข้าใจว่าทำไมจึงหาผู้ขายได้ไม่ครบ"></textarea></div>',
+        onSubmit: function (form, close) {
+          App.api('api_requestException', ctx.caseId, form.reasonCode.value, form.note.value.trim())
+            .then(function () {
+              close();
+              App.toast('ส่งคำขอยกเว้นให้หัวหน้าฝ่ายจัดซื้อแล้ว', 'ok');
+              ctx.refresh();
+            }).catch(App.showError);
+        }
+      });
+    }
+  });
+
+  App.registerCaseHeaderAction({
+    label: 'พิจารณาคำขอยกเว้น',
+    className: 'primary',
+    visible: function (ctx) {
+      return App.state.permissions.canApproveException &&
+        ctx.caseRecord.Exception_Status === 'PENDING' &&
+        ctx.caseRecord.Buyer_Owner !== App.state.user.email;   // the server enforces this too
+    },
+    run: function (ctx) {
+      var dialog = App.modal({
+        title: 'พิจารณาคำขอยกเว้น — ' + ctx.caseId,
+        submitLabel: 'อนุมัติ',
+        body:
+          '<dl class="kv">' +
+            '<dt>เหตุผลที่ขอ</dt><dd>' +
+              App.esc(App.labelOf('EXCEPTION_REASON', ctx.caseRecord.Exception_Reason_Code)) + '</dd>' +
+            '<dt>คำอธิบาย</dt><dd>' + App.esc(ctx.caseRecord.Exception_Note) + '</dd>' +
+            '<dt>ใบเสนอราคาที่ใช้ได้</dt><dd>' +
+              App.esc(ctx.rules ? ctx.rules.quotes.valid : '-') + ' / ' +
+              App.esc(ctx.rules ? ctx.rules.quotes.required : '-') + '</dd>' +
+          '</dl>' +
+          '<div class="field"><label for="decisionNote">ความเห็นของผู้พิจารณา <span class="req">*</span></label>' +
+            '<textarea id="decisionNote" name="note" required maxlength="2000"></textarea></div>' +
+          '<button type="button" class="danger" id="rejectBtn">ไม่อนุมัติ</button>',
+        onSubmit: function (form, close) { decide(ctx, form, close, true); }
+      });
+      dialog.form.querySelector('#rejectBtn').onclick = function () {
+        if (!dialog.form.note.value.trim()) {
+          App.toast('กรุณาระบุความเห็นก่อน', 'bad');
+          return;
+        }
+        decide(ctx, dialog.form, dialog.close, false);
+      };
+    }
+  });
+
+  function decide(ctx, form, close, approve) {
+    App.api('api_decideException', ctx.caseId, approve, form.note.value.trim())
+      .then(function () {
+        close();
+        App.toast(approve ? 'อนุมัติคำขอยกเว้นแล้ว' : 'ไม่อนุมัติคำขอยกเว้น', 'ok');
+        ctx.refresh();
+      }).catch(App.showError);
+  }
+
+  /* -------------------------------------------------------------- reopen */
+
+  App.registerCaseHeaderAction({
+    label: 'Reopen',
+    visible: function (ctx) {
+      return App.state.permissions.canReopen &&
+        (ctx.caseRecord.Status === 'CLOSED' || ctx.caseRecord.Status === 'CANCELLED');
+    },
+    run: function (ctx) {
+      App.askReason('เปิดงานที่ปิดไปแล้ว',
+        'ระบบจะย้อนงานกลับไปยังสถานะก่อนหน้าที่อ่านจากประวัติการแก้ไข')
+        .then(function (reason) {
+          App.api('api_reopenCase', ctx.caseId, reason).then(function (result) {
+            App.toast('เปิดงานใหม่แล้ว กลับไปที่ ' + App.statusLabel(result.restoredTo), 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+        });
+    }
+  });
+
+  /* ------------------------------------------------ tab: เอกสารอ้างอิง (PR) */
+
+  App.registerCaseTab({
+    id: 'references',
+    label: 'เลขเอกสาร (PR)',
+    order: 45,
+    render: function (host, ctx) {
+      var canAdd = ctx.canEdit && sequenceOf(ctx.caseRecord.Status) >= sequenceOf('SOURCING_DONE');
+
+      host.innerHTML =
+        '<div class="btn-row" style="margin-bottom:14px">' +
+          (canAdd ? '<button type="button" class="primary" id="addRefBtn">+ เพิ่มเลข PR</button>' : '') +
+          (ctx.canEdit && !canAdd
+            ? '<span class="faint">กรอกเลข PR ได้เมื่องานอยู่ในสถานะ "หา Vendor ครบแล้ว" ขึ้นไป</span>'
+            : '') +
+        '</div>' +
+        (ctx.references.length ? table(ctx) : '<div class="empty">ยังไม่มีเลขเอกสารสำหรับงานนี้</div>') +
+        '<p class="faint">1 งานมีได้หลาย PR และหลาย PO — PO และ GR จะเปิดใช้งานในโมดูลถัดไป</p>';
+
+      var add = host.querySelector('#addRefBtn');
+      if (add) add.onclick = function () { openRefForm(ctx); };
+      host.querySelectorAll('[data-delref]').forEach(function (b) {
+        b.onclick = function () { removeRef(ctx, b.dataset.delref, Number(b.dataset.version)); };
+      });
+    }
+  });
+
+  function sequenceOf(code) {
+    for (var i = 0; i < App.state.statuses.length; i++) {
+      if (App.state.statuses[i].code === code) return App.state.statuses[i].sequence;
+    }
+    return 0;
+  }
+
+  function table(ctx) {
+    var rows = ctx.references.map(function (r) {
+      return '<tr>' +
+        '<td class="nowrap">' + App.esc(App.labelOf('REF_TYPE', r.Ref_Type)) + '</td>' +
+        '<td>' + App.esc(r.Ref_No) + '</td>' +
+        '<td class="nowrap">' + App.esc(App.fmtDate(r.Ref_Date)) + '</td>' +
+        '<td class="num">' + App.esc(App.fmtMoney(r.Amount)) + '</td>' +
+        '<td>' + App.esc(r.Note || '') + '</td>' +
+        '<td class="nowrap">' + (ctx.canEdit
+          ? '<button type="button" class="subtle small" data-delref="' + App.esc(r.Ref_ID) +
+            '" data-version="' + App.esc(r.Version) + '">ลบ</button>'
+          : '') + '</td></tr>';
+    }).join('');
+
+    return '<div class="table-wrap"><table><thead><tr>' +
+      '<th>ประเภท</th><th>เลขที่เอกสาร</th><th>วันที่</th><th class="num">จำนวนเงิน</th>' +
+      '<th>หมายเหตุ</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function openRefForm(ctx) {
+    App.modal({
+      title: 'เพิ่มเลข PR',
+      submitLabel: 'บันทึก',
+      body: '<div class="grid two">' +
+        App.caseForm.field('Ref_No', 'เลขที่ PR',
+          '<input type="text" name="Ref_No" required maxlength="100">', true) +
+        App.caseForm.field('Ref_Date', 'วันที่ PR', '<input type="date" name="Ref_Date">') +
+        App.caseForm.field('Amount', 'จำนวนเงิน (ไม่รวม VAT)',
+          '<input type="number" name="Amount" step="any" min="0">') +
+        '<div class="field span-all"><label>หมายเหตุ</label>' +
+          '<textarea name="Note" maxlength="1000"></textarea></div>' +
+        '</div>',
+      onSubmit: function (form, close) {
+        App.api('api_addReference', ctx.caseId, {
+          Ref_Type: 'PR',
+          Ref_No: form.Ref_No.value.trim(),
+          Ref_Date: form.Ref_Date.value,
+          Amount: form.Amount.value,
+          Note: form.Note.value.trim()
+        }).then(function () {
+          close();
+          App.toast('บันทึกเลข PR แล้ว', 'ok');
+          ctx.refresh();
+        }).catch(function (error) {
+          if (error.code === 'DUPLICATE' && error.details && error.details.caseId) {
+            App.toast(error.message, 'bad');
+            return;
+          }
+          App.showError(error);
+        });
+      }
+    });
+  }
+
+  function removeRef(ctx, refId, version) {
+    App.askReason('ลบเลขเอกสาร').then(function (reason) {
+      App.api('api_deleteRecord', 'Case_References', refId, version, reason)
+        .then(function () {
+          App.toast('ลบแล้ว', 'ok');
+          ctx.refresh();
+        }).catch(App.showError);
+    });
+  }
+})();
+</script>

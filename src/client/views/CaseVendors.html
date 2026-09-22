@@ -1,0 +1,509 @@
+<script>
+/**
+ * Case Detail tab: Vendor & ราคา (SPEC §8.2).
+ *
+ * Lives in its own file and attaches through App.registerCaseTab, which is the
+ * same door a future "ต่อรองราคา" or "ตรวจคุณสมบัติ" tab will use.
+ *
+ * The matrix is rows = items, columns = vendors. Editing is deliberately
+ * spreadsheet-like: type across the grid, then save once.
+ */
+(function () {
+
+  App.registerCaseTab({
+    id: 'vendors',
+    label: 'Vendor & ราคา',
+    order: 30,
+    render: render
+  });
+
+  function render(host, ctx) {
+    var quotes = ctx.rules ? ctx.rules.quotes : null;
+    host.innerHTML =
+      '<div class="btn-row" style="margin-bottom:14px">' +
+        (ctx.canEdit ? '<button type="button" class="primary" id="addVendorBtn">+ เพิ่มผู้ขาย</button>' : '') +
+        (quotes ? '<span class="badge ' + (quotes.valid >= quotes.required ? 'ok' : 'warn') + '">' +
+          'ใบเสนอราคาที่ใช้ได้ ' + quotes.valid + ' / ' + quotes.required + '</span>' : '') +
+        '<span class="spacer"></span>' +
+        (ctx.canEdit && ctx.vendors.length && ctx.items.length
+          ? '<button type="button" class="primary" id="savePricesBtn">บันทึกราคา</button>' : '') +
+      '</div>' +
+      vendorTable(ctx) +
+      matrix(ctx);
+
+    var add = host.querySelector('#addVendorBtn');
+    if (add) add.onclick = function () { openVendorPicker(ctx); };
+
+    var save = host.querySelector('#savePricesBtn');
+    if (save) save.onclick = function () { savePrices(host, ctx); };
+
+    host.querySelectorAll('[data-editcv]').forEach(function (b) {
+      b.onclick = function () { openCaseVendor(ctx, find(ctx, b.dataset.editcv)); };
+    });
+    host.querySelectorAll('[data-delcv]').forEach(function (b) {
+      b.onclick = function () { removeVendor(ctx, find(ctx, b.dataset.delcv)); };
+    });
+    host.querySelectorAll('[data-upload]').forEach(function (b) {
+      b.onclick = function () { uploadQuote(ctx, find(ctx, b.dataset.upload)); };
+    });
+    host.querySelectorAll('input[data-price]').forEach(function (input) {
+      input.addEventListener('input', function () { recalc(host, ctx); });
+    });
+    host.querySelectorAll('[data-pastecol]').forEach(function (b) {
+      b.onclick = function () { openPricePaste(host, ctx, b.dataset.pastecol); };
+    });
+  }
+
+  function find(ctx, caseVendorId) {
+    return ctx.vendors.filter(function (v) { return v.caseVendor.Case_Vendor_ID === caseVendorId; })[0];
+  }
+
+  /* ------------------------------------------------------------ vendor list */
+
+  function vendorTable(ctx) {
+    if (!ctx.vendors.length) {
+      return '<div class="empty">ยังไม่ได้เชิญผู้ขายรายใดเข้าร่วมงานนี้</div>';
+    }
+    var rows = ctx.vendors.map(function (v) {
+      var cv = v.caseVendor;
+      var master = v.vendor || {};
+      return '<tr>' +
+        '<td>' + App.esc(master.Vendor_Name || cv.Vendor_ID) +
+          '<div class="faint">' + App.esc(master.Tax_ID || '') +
+          (master.Vendor_Status ? ' · ' + App.esc(App.labelOf('VENDOR_STATUS', master.Vendor_Status)) : '') +
+          '</div></td>' +
+        '<td class="nowrap"><span class="badge ' + responseClass(cv.Response_Status) + '">' +
+          App.esc(App.labelOf('RESPONSE_STATUS', cv.Response_Status)) + '</span></td>' +
+        '<td>' + App.esc(cv.Quote_No || '') +
+          (cv.Quote_Date ? '<div class="faint">' + App.esc(App.fmtDate(cv.Quote_Date)) + '</div>' : '') + '</td>' +
+        '<td class="nowrap">' + validUntilCell(cv) + '</td>' +
+        '<td class="num">' + App.esc(App.fmtMoney(v.grandTotal)) + '</td>' +
+        '<td>' + (cv.Quote_File_URL
+          ? '<a href="' + App.esc(cv.Quote_File_URL) + '" target="_blank" rel="noopener">เปิดไฟล์</a>'
+          : '<span class="faint">ยังไม่มีไฟล์</span>') + '</td>' +
+        '<td class="nowrap">' + (ctx.canEdit
+          ? '<button type="button" class="subtle small" data-editcv="' + App.esc(cv.Case_Vendor_ID) + '">แก้ไข</button>' +
+            '<button type="button" class="subtle small" data-upload="' + App.esc(cv.Case_Vendor_ID) + '">แนบไฟล์</button>' +
+            '<button type="button" class="subtle small" data-delcv="' + App.esc(cv.Case_Vendor_ID) + '">ลบ</button>'
+          : '') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    return '<div class="table-wrap" style="margin-bottom:20px"><table><thead><tr>' +
+      '<th>ผู้ขาย</th><th>สถานะการตอบกลับ</th><th>ใบเสนอราคา</th><th>ยืนราคาถึง</th>' +
+      '<th class="num">ยอดรวม (ไม่รวม VAT)</th><th>ไฟล์</th><th></th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function responseClass(code) {
+    if (code === 'QUOTED') return 'ok';
+    if (code === 'DECLINED' || code === 'WITHDRAWN') return 'bad';
+    if (code === 'NO_RESPONSE') return 'warn';
+    return 'info';
+  }
+
+  function validUntilCell(cv) {
+    if (!cv.Quote_Valid_Until) return '<span class="faint">ไม่ระบุ</span>';
+    var expired = new Date(cv.Quote_Valid_Until) < new Date(new Date().toDateString());
+    return App.esc(App.fmtDate(cv.Quote_Valid_Until)) +
+      (expired ? ' <span class="badge bad">หมดอายุ</span>' : '');
+  }
+
+  /* ----------------------------------------------------------- price matrix */
+
+  function matrix(ctx) {
+    if (!ctx.vendors.length) return '';
+    if (!ctx.items.length) {
+      return '<div class="alert info">เพิ่มรายการในแท็บ "รายการ Item" ก่อน จึงจะกรอกราคาได้</div>';
+    }
+
+    var head = '<tr><th>รายการ</th><th class="num">จำนวน</th><th>หน่วย</th>' +
+      ctx.vendors.map(function (v) {
+        return '<th class="num">' + App.esc((v.vendor && v.vendor.Vendor_Name) || v.caseVendor.Vendor_ID) +
+          '<div class="faint">ราคาต่อหน่วย</div>' +
+          (ctx.canEdit
+            ? '<button type="button" class="subtle small" data-pastecol="' +
+              App.esc(v.caseVendor.Case_Vendor_ID) + '">วางราคาจาก Excel</button>'
+            : '') +
+          '</th>';
+      }).join('') + '</tr>';
+
+    var body = ctx.items.map(function (item) {
+      var lowest = ctx.lowestPricePerItem[item.Item_Row_ID];
+      return '<tr>' +
+        '<td>' + App.esc(item.Item_Description) + '</td>' +
+        '<td class="num">' + App.esc(item.Quantity) + '</td>' +
+        '<td>' + App.esc(App.labelOf('UNIT', item.Unit)) + '</td>' +
+        ctx.vendors.map(function (v) {
+          var line = lineFor(v, item.Item_Row_ID);
+          var price = line ? line.Vendor_Unit_Price : '';
+          var best = line && lowest !== null && Number(price) === Number(lowest);
+          return '<td class="num' + (best ? ' best-price' : '') + '">' +
+            (ctx.canEdit
+              ? '<input type="number" step="any" min="0" class="right" style="min-width:110px" ' +
+                'data-price data-cv="' + App.esc(v.caseVendor.Case_Vendor_ID) + '" ' +
+                'data-item="' + App.esc(item.Item_Row_ID) + '" ' +
+                'data-unit="' + App.esc(line ? line.Vendor_Unit : item.Unit) + '" ' +
+                'data-version="' + App.esc(line ? line.Version : '') + '" ' +
+                'data-original="' + App.esc(price) + '" value="' + App.esc(price) + '">'
+              : App.esc(App.fmtMoney(price))) +
+            '</td>';
+        }).join('') + '</tr>';
+    }).join('');
+
+    var totals = '<tr><th colspan="3">ยอดรวมต่อผู้ขาย</th>' +
+      ctx.vendors.map(function (v) {
+        return '<th class="num" data-total="' + App.esc(v.caseVendor.Case_Vendor_ID) + '">' +
+          App.esc(App.fmtMoney(v.grandTotal)) + '</th>';
+      }).join('') + '</tr>';
+
+    return '<div class="card-header" style="padding-left:0"><h2>ตารางเปรียบเทียบราคา</h2>' +
+      '<span class="faint">ราคาไม่รวม VAT สกุลเงินบาท · ช่องสีเขียวคือราคาต่ำสุดของรายการนั้น</span></div>' +
+      '<div class="table-wrap"><table><thead>' + head + '</thead><tbody>' + body +
+      '</tbody><tfoot>' + totals + '</tfoot></table></div>';
+  }
+
+  function lineFor(vendorEntry, itemRowId) {
+    return vendorEntry.lines.filter(function (l) { return l.Item_Row_ID === itemRowId; })[0] || null;
+  }
+
+  /** Recomputes the footer as the buyer types, using the same quantity x price rule. */
+  function recalc(host, ctx) {
+    var quantities = {};
+    ctx.items.forEach(function (item) { quantities[item.Item_Row_ID] = Number(item.Quantity) || 0; });
+
+    ctx.vendors.forEach(function (v) {
+      var id = v.caseVendor.Case_Vendor_ID;
+      var total = 0;
+      host.querySelectorAll('input[data-price][data-cv="' + cssEscape(id) + '"]').forEach(function (input) {
+        var price = Number(input.value);
+        if (!input.value || isNaN(price)) return;
+        total += price * (quantities[input.dataset.item] || 0);
+      });
+      var cell = host.querySelector('[data-total="' + cssEscape(id) + '"]');
+      if (cell) cell.textContent = App.fmtMoney(total);
+    });
+  }
+
+  function cssEscape(value) {
+    return String(value).replace(/["\\]/g, '\\$&');
+  }
+
+  /* ------------------------------------------------------------- save prices */
+
+  function savePrices(host, ctx) {
+    var byVendor = {};
+    var touchesExisting = false;
+
+    host.querySelectorAll('input[data-price]').forEach(function (input) {
+      var original = input.dataset.original || '';
+      var value = input.value.trim();
+      if (value === original) return;
+      if (original !== '') touchesExisting = true;
+      if (!byVendor[input.dataset.cv]) byVendor[input.dataset.cv] = [];
+      byVendor[input.dataset.cv].push({
+        Item_Row_ID: input.dataset.item,
+        Vendor_Unit: input.dataset.unit,
+        Vendor_Unit_Price: value,
+        Version: input.dataset.version ? Number(input.dataset.version) : null
+      });
+    });
+
+    var vendorIds = Object.keys(byVendor);
+    if (!vendorIds.length) {
+      App.toast('ไม่มีราคาที่เปลี่ยนแปลง');
+      return;
+    }
+
+    var ask = touchesExisting
+      ? App.askReason('แก้ไขราคาที่ผู้ขายเสนอ', 'การแก้ไขหรือลบราคาที่บันทึกไว้แล้วต้องระบุเหตุผล')
+      : Promise.resolve('');
+
+    ask.then(function (reason) {
+      var chain = Promise.resolve();
+      var warnings = [];
+      vendorIds.forEach(function (caseVendorId) {
+        chain = chain.then(function () {
+          return App.api('api_saveQuoteLines', caseVendorId, byVendor[caseVendorId], reason)
+            .then(function (result) { warnings = warnings.concat(result.warnings || []); });
+        });
+      });
+      chain.then(function () {
+        App.toast('บันทึกราคาแล้ว', 'ok');
+        App.showWarnings(warnings);
+        ctx.refresh();
+      }).catch(App.showError);
+    });
+  }
+
+  /* -------------------------------------------------- วางราคาจาก Excel */
+
+  /**
+   * Fills one vendor's column from a block copied out of their quotation.
+   *
+   * It only types into the grid — nothing is sent until the buyer presses
+   * "บันทึกราคา", which keeps the reason prompt for overwriting existing prices
+   * exactly where it already is. A paste is undone by closing the tab without saving.
+   */
+  function openPricePaste(host, ctx, caseVendorId) {
+    var entry = find(ctx, caseVendorId);
+    var vendorName = (entry && entry.vendor && entry.vendor.Vendor_Name) || caseVendorId;
+    var inputs = Array.prototype.slice.call(
+      host.querySelectorAll('input[data-price][data-cv="' + cssEscape(caseVendorId) + '"]'));
+
+    var dialog = App.modal({
+      title: 'วางราคาของ ' + vendorName,
+      submitLabel: 'เติมลงช่องราคา',
+      wide: true,
+      body:
+        '<div class="alert info">คัดลอกคอลัมน์ <strong>ราคาต่อหน่วย</strong> จากใบเสนอราคา ' +
+          'แล้ววางที่นี่ — ระบบจะกรอกลงเรียงจากบนลงตามลำดับรายการในตาราง<br>' +
+          'บรรทัดที่เว้นว่าง = ผู้ขายไม่ได้เสนอรายการนั้น · ตัวคั่นหลักพันและสัญลักษณ์เงินตัดออกให้เอง<br>' +
+          'ยังไม่บันทึกจนกว่าจะกด "บันทึกราคา" ในหน้าหลัก</div>' +
+        '<div class="field"><label for="priceBox">ราคาต่อหน่วย (บรรทัดละ 1 รายการ)</label>' +
+          '<textarea id="priceBox" name="priceBox" rows="8" spellcheck="false" ' +
+          'style="font-family:ui-monospace,Menlo,Consolas,monospace;white-space:pre"></textarea></div>' +
+        '<div id="pricePreview"></div>',
+      onSubmit: function (form, close) {
+        var prices = parsePriceColumn(form.priceBox.value);
+        if (!prices.length) {
+          App.toast('ยังไม่ได้วางราคา', 'bad');
+          return;
+        }
+        if (prices.some(function (p) { return p.invalid; })) {
+          App.toast('มีบรรทัดที่ไม่ใช่ตัวเลข แก้ก่อนจึงจะเติมลงได้', 'bad');
+          return;
+        }
+        prices.slice(0, inputs.length).forEach(function (p, i) {
+          inputs[i].value = p.blank ? '' : p.value;
+        });
+        recalc(host, ctx);
+        close();
+        App.toast('เติมราคาแล้ว ' + Math.min(prices.length, inputs.length) +
+          ' รายการ — กด "บันทึกราคา" เพื่อบันทึก', 'ok');
+      }
+    });
+
+    var box = dialog.form.querySelector('#priceBox');
+    var preview = dialog.form.querySelector('#pricePreview');
+    function refresh() {
+      preview.innerHTML = pricePreview(parsePriceColumn(box.value), ctx.items, inputs.length);
+    }
+    box.addEventListener('input', refresh);
+    refresh();
+  }
+
+  /**
+   * Reads a pasted column of prices. A multi-column paste keeps the last cell of
+   * each line, because a buyer dragging across a quotation usually catches the
+   * description alongside the amount and the amount is what sits on the right.
+   */
+  function parsePriceColumn(text) {
+    var lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+
+    return lines.map(function (line) {
+      var cells = line.split('\t');
+      var cell = cells[cells.length - 1];
+      var cleaned = String(cell).replace(/[,\s\u00a0\u0e3f]/g, '').replace(/^THB/i, '');
+      if (cleaned === '') return { blank: true, value: '' };
+      if (isNaN(Number(cleaned))) return { invalid: true, value: String(cell).trim() };
+      if (Number(cleaned) < 0) return { invalid: true, value: String(cell).trim() };
+      return { value: cleaned };
+    });
+  }
+
+  function pricePreview(prices, items, slots) {
+    if (!prices.length) {
+      return '<div class="empty">วางราคาในช่องด้านบน แล้วตารางจะแสดงว่าราคาไหนจะลงรายการใด</div>';
+    }
+    var rows = prices.map(function (p, i) {
+      var item = items[i];
+      var beyond = i >= slots;
+      return '<tr class="' + (p.invalid || beyond ? 'bad-row' : '') + '">' +
+        '<td class="num">' + (i + 1) + '</td>' +
+        '<td>' + (item ? App.esc(item.Item_Description) : '<span class="faint">—</span>') + '</td>' +
+        '<td class="num">' + (item ? App.esc(item.Quantity) : '') + '</td>' +
+        '<td class="num">' + App.esc(p.blank ? '' : p.value) + '</td>' +
+        '<td>' + (beyond ? '<span class="badge bad">เกิจำนวนรายการ จะถูกตัดทิ้ง</span>'
+          : p.invalid ? '<span class="badge bad">ไม่ใช่ตัวเลข</span>'
+          : p.blank ? '<span class="badge warn">เว้นว่าง — ไม่เสนอรายการนี้</span>'
+          : '<span class="badge ok">พร้อม</span>') + '</td>' +
+        '</tr>';
+    }).join('');
+
+    var mismatch = prices.length === slots ? '' :
+      '<div class="alert warn">วางมา ' + prices.length + ' บรรทัด แต่งานนี้มี ' + slots +
+      ' รายการ กรุณาตรวจว่าราคาตรงกับรายการก่อนเติมลง</div>';
+
+    return mismatch +
+      '<div class="table-wrap" style="max-height:300px;overflow:auto"><table><thead><tr>' +
+      '<th class="num">#</th><th>จะลงรายการ</th><th class="num">จำนวน</th>' +
+      '<th class="num">ราคาต่อหน่วย</th><th>สถานะ</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  /* ------------------------------------------------------------ vendor forms */
+
+  function openVendorPicker(ctx) {
+    var dialog = App.modal({
+      title: 'เพิ่มผู้ขายเข้างาน',
+      submitLabel: 'เพิ่มเข้างาน',
+      wide: true,
+      body:
+        '<div class="field"><label for="vendorSearch">ค้นหาผู้ขาย (ชื่อ / เลขผู้เสียภาษี / รหัส)</label>' +
+          '<input type="search" id="vendorSearch" placeholder="พิมพ์อย่างน้อย 2 ตัวอักษร"></div>' +
+        '<div id="vendorResults" class="table-wrap" style="max-height:260px;overflow:auto"></div>' +
+        '<input type="hidden" name="Vendor_ID" required>' +
+        '<div id="pickedVendor" class="alert info" style="display:none"></div>' +
+        '<div class="grid two">' +
+          App.caseForm.field('Invited_Date', 'วันที่เชิญ',
+            '<input type="date" name="Invited_Date" required value="' +
+            App.esc(App.toInputDate(new Date().toISOString())) + '">', true) +
+          App.caseForm.field('Invite_Channel', 'ช่องทางที่ติดต่อ',
+            '<select name="Invite_Channel">' + App.optionsFor('CHANNEL', 'EMAIL') + '</select>') +
+        '</div>' +
+        '<p class="faint">ยังไม่มีผู้ขายรายนี้ในระบบ? เพิ่มได้ที่เมนู "ผู้ขาย" แล้วกลับมาเชิญเข้างาน</p>',
+      onSubmit: function (form, close) {
+        if (!form.Vendor_ID.value) {
+          App.toast('กรุณาเลือกผู้ขายจากรายการ', 'bad');
+          return;
+        }
+        App.api('api_addVendorToCase', ctx.caseId, form.Vendor_ID.value, {
+          Invited_Date: form.Invited_Date.value,
+          Invite_Channel: form.Invite_Channel.value,
+          Response_Status: 'INVITED'
+        }).then(function (result) {
+          close();
+          App.toast('เพิ่มผู้ขายแล้ว', 'ok');
+          App.showWarnings(result.warnings);
+          ctx.refresh();
+        }).catch(App.showError);
+      }
+    });
+
+    var form = dialog.form;
+    var search = form.querySelector('#vendorSearch');
+    var results = form.querySelector('#vendorResults');
+    var picked = form.querySelector('#pickedVendor');
+    var timer = null;
+
+    search.addEventListener('input', function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        if (search.value.trim().length < 2) { results.innerHTML = ''; return; }
+        App.api('api_searchVendors', search.value.trim()).then(function (data) {
+          if (!data.vendors.length) {
+            results.innerHTML = '<div class="empty">ไม่พบผู้ขายที่ตรงกับคำค้น</div>';
+            return;
+          }
+          results.innerHTML = '<table><tbody>' + data.vendors.map(function (v) {
+            return '<tr><td><button type="button" class="link-btn" data-pick="' + App.esc(v.Vendor_ID) + '">' +
+              App.esc(v.Vendor_Name) + '</button><div class="faint">' + App.esc(v.Tax_ID) + ' · ' +
+              App.esc(App.labelOf('VENDOR_STATUS', v.Vendor_Status)) + '</div></td></tr>';
+          }).join('') + '</tbody></table>';
+
+          results.querySelectorAll('[data-pick]').forEach(function (b) {
+            b.onclick = function () {
+              form.Vendor_ID.value = b.dataset.pick;
+              picked.style.display = 'block';
+              picked.textContent = 'เลือกแล้ว: ' + b.textContent;
+            };
+          });
+        }).catch(App.showError);
+      }, 250);
+    });
+  }
+
+  function openCaseVendor(ctx, entry) {
+    var cv = entry.caseVendor;
+    App.modal({
+      title: 'แก้ไขข้อมูลผู้ขายในงาน',
+      submitLabel: 'บันทึก',
+      wide: true,
+      body: '<div class="grid two">' +
+        App.caseForm.field('Response_Status', 'สถานะการตอบกลับ',
+          '<select name="Response_Status" required>' +
+          App.optionsFor('RESPONSE_STATUS', cv.Response_Status, null, false) + '</select>', true) +
+        App.caseForm.field('Invite_Channel', 'ช่องทางที่ติดต่อ',
+          '<select name="Invite_Channel">' + App.optionsFor('CHANNEL', cv.Invite_Channel) + '</select>') +
+        App.caseForm.field('Quote_No', 'เลขที่ใบเสนอราคา',
+          '<input type="text" name="Quote_No" maxlength="100" value="' + App.esc(cv.Quote_No || '') + '">') +
+        App.caseForm.field('Quote_Date', 'วันที่ใบเสนอราคา',
+          '<input type="date" name="Quote_Date" value="' + App.esc(App.toInputDate(cv.Quote_Date)) + '">') +
+        App.caseForm.field('Quote_Valid_Until', 'ยืนราคาถึงวันที่',
+          '<input type="date" name="Quote_Valid_Until" value="' + App.esc(App.toInputDate(cv.Quote_Valid_Until)) + '">') +
+        App.caseForm.field('Quote_Revision', 'ครั้งที่แก้ไขใบเสนอราคา',
+          '<input type="number" name="Quote_Revision" min="1" step="1" value="' +
+          App.esc(cv.Quote_Revision || 1) + '">') +
+        '<div class="field span-all"><label>หมายเหตุ</label>' +
+          '<textarea name="Remark" maxlength="1000">' + App.esc(cv.Remark || '') + '</textarea></div>' +
+        '<div class="field span-all"><label>เหตุผล (บังคับเมื่อเปลี่ยนสถานะการตอบกลับ)</label>' +
+          '<input type="text" name="reason" maxlength="500"></div>' +
+        '</div>',
+      onSubmit: function (form, close) {
+        App.api('api_updateCaseVendor', cv.Case_Vendor_ID, {
+          Response_Status: form.Response_Status.value,
+          Invite_Channel: form.Invite_Channel.value,
+          Quote_No: form.Quote_No.value.trim(),
+          Quote_Date: form.Quote_Date.value,
+          Quote_Valid_Until: form.Quote_Valid_Until.value,
+          Quote_Revision: form.Quote_Revision.value,
+          Remark: form.Remark.value.trim()
+        }, cv.Version, form.reason.value.trim()).then(function (result) {
+          close();
+          App.toast('บันทึกแล้ว', 'ok');
+          App.showWarnings(result.warnings);
+          ctx.refresh();
+        }).catch(App.showError);
+      }
+    });
+  }
+
+  function removeVendor(ctx, entry) {
+    App.askReason('ลบผู้ขายออกจากงาน',
+      'ราคาที่ผู้ขายรายนี้เสนอจะถูกลบไปด้วย และทั้งหมดจะถูกบันทึกไว้ในประวัติการแก้ไข')
+      .then(function (reason) {
+        App.api('api_deleteRecord', 'Case_Vendors', entry.caseVendor.Case_Vendor_ID,
+          entry.caseVendor.Version, reason)
+          .then(function (result) {
+            App.toast('ลบผู้ขายออกจากงานแล้ว', 'ok');
+            App.showWarnings(result.warnings);
+            ctx.refresh();
+          }).catch(App.showError);
+      });
+  }
+
+  /** Reads the chosen file in the browser and posts it as base64 (SPEC §9). */
+  function uploadQuote(ctx, entry) {
+    var dialog = App.modal({
+      title: 'แนบไฟล์ใบเสนอราคา',
+      submitLabel: 'อัปโหลด',
+      body: '<div class="field"><label for="quoteFile">ไฟล์ใบเสนอราคา (ไม่เกิน 10 MB)</label>' +
+        '<input type="file" id="quoteFile" name="file" required></div>' +
+        '<p class="faint">ไฟล์จะถูกเก็บในโฟลเดอร์ของงานนี้ และแชร์เฉพาะภายในโดเมนของบริษัท</p>',
+      onSubmit: function (form, close) {
+        var file = form.file.files[0];
+        if (!file) return;
+        var reader = new FileReader();
+        reader.onload = function () {
+          var base64 = String(reader.result).split(',')[1];
+          App.api('api_uploadFile', ctx.caseId, file.name, file.type, base64)
+            .then(function (uploaded) {
+              return App.api('api_updateCaseVendor', entry.caseVendor.Case_Vendor_ID,
+                { Quote_File_URL: uploaded.url }, entry.caseVendor.Version, 'แนบไฟล์ใบเสนอราคา');
+            })
+            .then(function () {
+              close();
+              App.toast('อัปโหลดไฟล์แล้ว', 'ok');
+              ctx.refresh();
+            }).catch(App.showError);
+        };
+        reader.onerror = function () { App.toast('อ่านไฟล์ไม่สำเร็จ', 'bad'); };
+        reader.readAsDataURL(file);
+      }
+    });
+    return dialog;
+  }
+})();
+</script>
